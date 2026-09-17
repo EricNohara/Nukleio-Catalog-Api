@@ -1,0 +1,21 @@
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+.wrangler/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+.dev.vars
+
+# Local logs and operating-system files
+*.log
+.DS_Store
+Thumbs.db
+
+# Large source downloads and binary catalog assets
+data/raw/
+data/assets/
+data/tmp/
