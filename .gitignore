@@ -16,6 +16,5 @@ coverage/
 Thumbs.db
 
 # Large source downloads and binary catalog assets
-data/raw/
-data/assets/
-data/tmp/
+data/*
+*.csv

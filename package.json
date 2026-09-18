@@ -4,7 +4,21 @@
   "private": true,
   "description": "Reusable reference-data catalogs served independently from Nukleio's application database.",
   "type": "module",
+  "scripts": {
+    "import:colleges": "tsx scripts/import/import-ipeds.ts"
+  },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "csv-parse": "^7.0.2",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260917.1",
+    "@types/node": "^26.6.1",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.134.0"
   }
 }

@@ -1,0 +1,18 @@
+{
+    "name": "nukleio-catalog-api",
+    "main": "src/index.ts",
+    "compatibility_date": "2026-09-17",
+    "d1_databases": [
+        {
+            "binding": "DB",
+            "database_name": "nukleio-catalog",
+            "database_id": "ab4d2cd8-7eda-49d2-8166-5c70063a167c"
+        }
+    ],
+    "r2_buckets": [
+        {
+            "binding": "ASSETS",
+            "bucket_name": "nukleio-catalog-assets"
+        }
+    ]
+}
