@@ -5,13 +5,21 @@
   "description": "Reusable reference-data catalogs served independently from Nukleio's application database.",
   "type": "module",
   "scripts": {
-    "import:colleges": "tsx scripts/import/import-ipeds.ts"
+    "import:colleges": "tsx scripts/import/import-ipeds.ts",
+    "import:private-highschools": "tsx scripts/import/import-private-highschools.ts",
+    "audit:education-duplicates": "tsx scripts/audit/audit-education-duplicates.ts",
+    "audit:education-duplicate-review": "tsx scripts/audit/build-education-duplicate-review.ts",
+    "audit:consolidate-education-duplicates": "tsx scripts/audit/consolidate-education-duplicates.ts",
+    "logos:website": "tsx scripts/logos/import-website-logos.ts",
+    "enrichment:missing-websites": "tsx scripts/enrichment/export-missing-websites.ts",
+    "enrichment:import-websites": "tsx scripts/enrichment/import-enriched-websites.ts"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
     "csv-parse": "^7.0.2",
+    "sharp": "^0.35.4",
     "zod": "^4.6.5"
   },
   "devDependencies": {

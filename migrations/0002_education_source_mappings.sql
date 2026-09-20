@@ -1,0 +1,3 @@
+-- Superseded before remote application. The source-mapping table was removed
+-- from the design because catalog deduplication does not require a second
+-- table or a full-table backfill.
