@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -20,9 +21,9 @@ const DEFAULT_CONCURRENCY = 24;
 const DEFAULT_PER_HOST_DELAY_MS = 750;
 const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_MAX_PAGES = 4;
-const DEFAULT_MAX_CANDIDATES = 3;
+const DEFAULT_MAX_CANDIDATES = 5;
 const DEFAULT_MIN_SCORE = 75;
-const MAX_DISCOVERY_CANDIDATES = 12;
+const MAX_DISCOVERY_CANDIDATES = 24;
 const MAX_HTML_BYTES = 2 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 512 * 1024;
@@ -57,7 +58,9 @@ type Options = {
 type Candidate = {
   institution: Institution;
   sourcePageUrl: string;
-  url: string;
+  key: string;
+  url: string | null;
+  inlineSvg: string | null;
   source: string;
   initialScore: number;
   reasons: string[];
@@ -116,7 +119,8 @@ const POSITIVE_TOKENS: Array<[string, number]> = [
 ];
 const NEGATIVE_TOKENS: Array<[string, number]> = [
   ["hero", -28], ["banner", -25], ["background", -20], ["cover", -18], ["social", -16],
-  ["share", -16], ["thumbnail", -14], ["avatar", -12], ["advert", -25],
+  ["share", -16], ["thumbnail", -14], ["avatar", -12], ["advert", -25], ["recaptcha", -70],
+  ["gstatic", -50], ["facebook", -30], ["twitter", -30], ["linkedin", -30], ["wordpress", -20],
 ];
 const RELEVANT_PAGE_TOKENS = ["about", "branding", "brand", "identity", "media", "contact", "who-we-are", "who_we_are"];
 
@@ -134,7 +138,7 @@ Options:
   --per-host-delay-ms <ms>     Minimum delay between requests to one host (default: ${DEFAULT_PER_HOST_DELAY_MS})
   --timeout-ms <ms>            Per-request timeout (default: ${DEFAULT_TIMEOUT_MS})
   --max-pages <count>          Homepage plus relevant same-site pages; 1-4 (default: ${DEFAULT_MAX_PAGES})
-  --max-candidates <count>     Downloaded WebP previews per school; 1-3 (default: ${DEFAULT_MAX_CANDIDATES})
+  --max-candidates <count>     Downloaded WebP previews per school; 1-5 (default: ${DEFAULT_MAX_CANDIDATES})
   --min-score <score>          Score needed to mark rank 1 as auto-selected; 0-100 (default: ${DEFAULT_MIN_SCORE})
   --refresh-failed             Retry schools previously recorded only as errors or no-candidate results
   --render-review              Rebuild the compact CSV and visual HTML review from the local manifest
@@ -197,7 +201,7 @@ function parseOptions(argv: string[]): Options {
 
   if (limit < 1 || concurrency < 1 || perHostDelayMs < 0 || timeoutMs < 1) throw new Error("--limit, --concurrency, --per-host-delay-ms, and --timeout-ms must be positive.");
   if (maxPages < 1 || maxPages > 4) throw new Error("--max-pages must be between 1 and 4.");
-  if (maxCandidates < 1 || maxCandidates > 3) throw new Error("--max-candidates must be between 1 and 3.");
+  if (maxCandidates < 1 || maxCandidates > 5) throw new Error("--max-candidates must be between 1 and 5.");
   if (minScore < 0 || minScore > 100) throw new Error("--min-score must be between 0 and 100.");
   return { limit, concurrency, perHostDelayMs, timeoutMs, maxPages, maxCandidates, minScore, refreshFailed, renderReview, resetReview, yes };
 }
@@ -290,9 +294,48 @@ function parseSrcset(value: string): string[] {
   return value.split(",").map((entry) => entry.trim().split(/\s+/)[0]).filter(Boolean);
 }
 
+function hasPositiveLogoSignal(value: string): boolean {
+  const text = value.toLowerCase();
+  return POSITIVE_TOKENS.some(([token]) => text.includes(token));
+}
+
+function rejectedAsset(value: string): boolean {
+  return /recaptcha|gstatic\.com|wp-includes\/images\/w-logo|(?:social.*sprite|sprite.*social)|(?:facebook|twitter|linkedin)[-_]?button/i.test(value);
+}
+
+function institutionMatchScore(institution: Institution, value: string): { score: number; reasons: string[] } {
+  const text = value.toLowerCase();
+  const ignored = new Set(["a", "an", "and", "at", "career", "college", "center", "for", "high", "in", "of", "school", "technical", "the", "university"]);
+  const nameTokens = institution.name.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length >= 3 && !ignored.has(token));
+  const matched = nameTokens.filter((token) => text.includes(token));
+  const reasons = matched.map((token) => `institution:${token}`);
+  let score = Math.min(30, matched.length * 12);
+  const acronym = nameTokens.map((token) => token[0]).join("");
+  if (acronym.length >= 3 && text.includes(acronym)) {
+    score += 35;
+    reasons.push(`institution-acronym:${acronym.toUpperCase()}`);
+  }
+  return { score, reasons };
+}
+
+function structuralScore(value: string): { score: number; reasons: string[] } {
+  const text = value.toLowerCase();
+  const reasons: string[] = [];
+  let score = 0;
+  if (/<header\b|headerlogo|header-logo|logoimage|logo-image/.test(text)) {
+    score += 28;
+    reasons.push("structure:header");
+  }
+  if (/\bid\s*=\s*["'][^"']*logo|\bclass\s*=\s*["'][^"']*logo|\balt\s*=\s*["'][^"']*logo/.test(text)) {
+    score += 26;
+    reasons.push("structure:logo-container");
+  }
+  return { score, reasons };
+}
+
 function addCandidate(candidates: Map<string, Candidate>, candidate: Candidate): void {
-  const existing = candidates.get(candidate.url);
-  if (!existing || candidate.initialScore > existing.initialScore) candidates.set(candidate.url, candidate);
+  const existing = candidates.get(candidate.key);
+  if (!existing || candidate.initialScore > existing.initialScore) candidates.set(candidate.key, candidate);
 }
 
 function addImageCandidate(
@@ -303,21 +346,56 @@ function addImageCandidate(
   source: string,
   baseScore: number,
   signalText: string,
+  structuralContext = "",
 ): void {
   if (!rawUrl) return;
   const url = normalizeUrl(rawUrl, pageUrl);
   if (!url) return;
+  if (rejectedAsset(`${url} ${signalText}`)) return;
   const urlSignals = tokenScore(url);
   const contextSignals = tokenScore(signalText);
+  const institutionSignals = institutionMatchScore(institution, `${url} ${signalText}`);
+  const structureSignals = structuralScore(structuralContext);
   const genericImageSource = source === "image-element" || source === "picture-source" || source === "css-background";
+  const explicitSignal = hasPositiveLogoSignal(`${url} ${signalText}`) || institutionSignals.score > 0 || structureSignals.score > 0;
+  if (source === "css-background" && !explicitSignal) return;
+  if ((source === "image-element" || source === "picture-source") && !explicitSignal) return;
   const contextScore = genericImageSource ? Math.trunc(contextSignals.score * 0.35) : contextSignals.score;
   addCandidate(candidates, {
     institution,
     sourcePageUrl: pageUrl,
+    key: url,
     url,
+    inlineSvg: null,
     source,
-    initialScore: baseScore + urlSignals.score + contextScore,
-    reasons: [`source:${source}`, ...urlSignals.reasons.map((reason) => `url-${reason}`), ...contextSignals.reasons.map((reason) => `context-${reason}`)],
+    initialScore: baseScore + urlSignals.score + contextScore + institutionSignals.score + structureSignals.score,
+    reasons: [
+      `source:${source}`,
+      ...urlSignals.reasons.map((reason) => `url-${reason}`),
+      ...contextSignals.reasons.map((reason) => `context-${reason}`),
+      ...institutionSignals.reasons,
+      ...structureSignals.reasons,
+    ],
+  });
+}
+
+function addInlineSvgCandidate(candidates: Map<string, Candidate>, institution: Institution, pageUrl: string, svg: string, context: string): void {
+  const svgTitle = svg.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1]?.replace(/<[^>]*>/g, " ") ?? "";
+  const signals = `${svgTitle} ${context}`;
+  const tokenSignals = tokenScore(signals);
+  const institutionSignals = institutionMatchScore(institution, signals);
+  const structureSignals = structuralScore(context);
+  if (!hasPositiveLogoSignal(signals) && institutionSignals.score === 0 && structureSignals.score === 0) return;
+  const key = `inline-svg:${createHash("sha256").update(pageUrl).update(svg).digest("hex")}`;
+  addCandidate(candidates, {
+    institution,
+    sourcePageUrl: pageUrl,
+    key,
+    url: null,
+    inlineSvg: svg,
+    source: "inline-svg",
+    initialScore: 65 + tokenSignals.score + institutionSignals.score + structureSignals.score,
+    reasons: ["source:inline-svg", ...tokenSignals.reasons, ...institutionSignals.reasons, ...structureSignals.reasons],
   });
 }
 
@@ -350,29 +428,37 @@ function discoverHtmlCandidates(institution: Institution, html: string, pageUrl:
         if (manifestUrl) manifestUrls.push(manifestUrl);
       }
       if (rel.includes("icon") || rel.includes("image_src")) {
-        addImageCandidate(candidates, institution, pageUrl, href, "document-icon", rel.includes("icon") ? 72 : 56, `${rel} ${attributes.get("sizes") ?? ""}`);
+        addImageCandidate(candidates, institution, pageUrl, href, "document-icon", rel.includes("icon") ? 32 : 22, `${rel} ${attributes.get("sizes") ?? ""}`);
       }
       continue;
     }
     if (tagName === "meta") {
       const marker = `${attributes.get("property") ?? ""} ${attributes.get("name") ?? ""}`.toLowerCase();
       if (marker.includes("og:image") || marker.includes("twitter:image") || marker === "image") {
-        addImageCandidate(candidates, institution, pageUrl, attributes.get("content"), "metadata-image", 18, marker);
+        addImageCandidate(candidates, institution, pageUrl, attributes.get("content"), "metadata-image", 5, marker);
       }
       continue;
     }
     const source = tagName === "source" ? "picture-source" : "image-element";
     const signals = `${attributes.get("alt") ?? ""} ${attributes.get("class") ?? ""} ${attributes.get("id") ?? ""} ${attributes.get("title") ?? ""}`;
-    const baseScore = 8;
-    addImageCandidate(candidates, institution, pageUrl, attributes.get("src"), source, baseScore, signals);
-    addImageCandidate(candidates, institution, pageUrl, attributes.get("data-src"), source, baseScore, signals);
-    for (const url of parseSrcset(attributes.get("srcset") ?? "")) addImageCandidate(candidates, institution, pageUrl, url, source, baseScore, signals);
-    for (const url of parseSrcset(attributes.get("data-srcset") ?? "")) addImageCandidate(candidates, institution, pageUrl, url, source, baseScore, signals);
+    const index = match.index ?? 0;
+    const structuralContext = html.slice(Math.max(0, index - 1_500), Math.min(html.length, index + match[0].length + 300));
+    const baseScore = 5;
+    addImageCandidate(candidates, institution, pageUrl, attributes.get("src"), source, baseScore, signals, structuralContext);
+    addImageCandidate(candidates, institution, pageUrl, attributes.get("data-src"), source, baseScore, signals, structuralContext);
+    for (const url of parseSrcset(attributes.get("srcset") ?? "")) addImageCandidate(candidates, institution, pageUrl, url, source, baseScore, signals, structuralContext);
+    for (const url of parseSrcset(attributes.get("data-srcset") ?? "")) addImageCandidate(candidates, institution, pageUrl, url, source, baseScore, signals, structuralContext);
   }
   for (const match of html.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/gi)) {
-    addImageCandidate(candidates, institution, pageUrl, match[1], "css-background", 6, match[1]);
+    addImageCandidate(candidates, institution, pageUrl, match[1], "css-background", 0, match[1]);
   }
-  addImageCandidate(candidates, institution, pageUrl, "/favicon.ico", "favicon-fallback", 36, "favicon");
+  const svgPattern = /<svg\b[^>]*>[\s\S]*?<\/svg\s*>/gi;
+  for (const match of html.matchAll(svgPattern)) {
+    const index = match.index ?? 0;
+    const context = html.slice(Math.max(0, index - 1_500), Math.min(html.length, index + match[0].length + 300));
+    addInlineSvgCandidate(candidates, institution, pageUrl, match[0], context);
+  }
+  addImageCandidate(candidates, institution, pageUrl, "/favicon.ico", "favicon-fallback", 10, "favicon");
   return { candidates: [...candidates.values()], manifestUrls: [...new Set(manifestUrls)] };
 }
 
@@ -383,7 +469,7 @@ function manifestCandidates(institution: Institution, manifestUrl: string, value
     if (!icon || typeof icon !== "object") continue;
     const record = icon as { src?: unknown; sizes?: unknown; purpose?: unknown };
     if (typeof record.src !== "string") continue;
-    addImageCandidate(candidates, institution, manifestUrl, record.src, "web-manifest", 68, `${String(record.sizes ?? "")} ${String(record.purpose ?? "")}`);
+    addImageCandidate(candidates, institution, manifestUrl, record.src, "web-manifest", 28, `${String(record.sizes ?? "")} ${String(record.purpose ?? "")}`);
   }
   return [...candidates.values()];
 }
@@ -526,15 +612,15 @@ function scoreCandidate(candidate: Candidate, width: number, height: number): { 
   const reasons = [...candidate.reasons];
   const ratio = width / height;
   if (ratio >= 0.65 && ratio <= 1.7) {
-    score += 12;
-    reasons.push("shape:logo-like");
+    score += 4;
+    reasons.push("shape:tie-breaker");
   } else if (ratio > 4 || ratio < 0.25) {
-    score -= 20;
+    score -= 12;
     reasons.push("shape:banner-like");
   }
   if (width >= 32 && height >= 32) {
-    score += 5;
-    reasons.push("size:usable");
+    score += 2;
+    reasons.push("size:tie-breaker");
   }
   return { score: Math.max(0, Math.min(100, score)), reasons };
 }
@@ -605,7 +691,7 @@ async function evaluateInstitution(institution: Institution, options: Options, l
   }
 
   const discoveryList = [...candidates.values()]
-    .sort((left, right) => right.initialScore - left.initialScore || left.url.localeCompare(right.url))
+    .sort((left, right) => right.initialScore - left.initialScore || left.key.localeCompare(right.key))
     .slice(0, MAX_DISCOVERY_CANDIDATES);
   if (discoveryList.length === 0) {
     return [reviewRow(institution, { status: firstError ? "error" : "no_candidates", error: firstError ?? "No image candidates found." })];
@@ -614,7 +700,9 @@ async function evaluateInstitution(institution: Institution, options: Options, l
   const converted: CandidateResult[] = [];
   for (const candidate of discoveryList) {
     try {
-      const image = await fetchImage(candidate.url, options, limiter);
+      const image = candidate.inlineSvg
+        ? { bytes: Buffer.from(candidate.inlineSvg, "utf8"), contentType: "image/svg+xml", finalUrl: candidate.sourcePageUrl }
+        : await fetchImage(candidate.url as string, options, limiter);
       const preview = await makeWebp(image.bytes);
       const scored = scoreCandidate(candidate, preview.width, preview.height);
       converted.push({
