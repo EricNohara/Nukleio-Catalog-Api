@@ -10,7 +10,7 @@
     "audit:education-duplicates": "tsx scripts/audit/audit-education-duplicates.ts",
     "audit:education-duplicate-review": "tsx scripts/audit/build-education-duplicate-review.ts",
     "audit:consolidate-education-duplicates": "tsx scripts/audit/consolidate-education-duplicates.ts",
-    "logos:website": "tsx scripts/logos/import-website-logos.ts",
+    "logos:scrape": "tsx scripts/logos/scrape-website-logos.ts",
     "enrichment:missing-websites": "tsx scripts/enrichment/export-missing-websites.ts",
     "enrichment:import-websites": "tsx scripts/enrichment/import-enriched-websites.ts"
   },
