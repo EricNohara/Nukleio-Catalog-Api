@@ -163,6 +163,22 @@ type RetrievalReviewRow = {
 type EvaluationResult = {
   reviewRows: ReviewRow[];
   retrievalRows: RetrievalReviewRow[];
+  timings: {
+    discoveryMs: number;
+    textQueueWaitMs: number;
+    textExecutionMs: number;
+    conversionMs: number;
+    visionQueueWaitMs: number;
+    visionExecutionMs: number;
+    totalMs: number;
+  };
+};
+
+type TextRankingResult = {
+  candidates: Candidate[];
+  retrievalRows: RetrievalReviewRow[];
+  queueWaitMs: number;
+  executionMs: number;
 };
 
 const ACCEPTABLE_AI_KINDS = new Set<LogoCandidateKind>(["logo", "wordmark", "seal", "crest"]);
@@ -810,11 +826,14 @@ class WorkQueue {
 
   constructor(private readonly concurrency: number) {}
 
-  async run<T>(action: () => Promise<T>): Promise<T> {
+  async runWithTiming<T>(action: () => Promise<T>): Promise<{ value: T; queueWaitMs: number; executionMs: number }> {
+    const queuedAt = Date.now();
     if (this.active >= this.concurrency) await new Promise<void>((resolve) => this.waiting.push(resolve));
+    const startedAt = Date.now();
     this.active += 1;
     try {
-      return await action();
+      const value = await action();
+      return { value, queueWaitMs: startedAt - queuedAt, executionMs: Date.now() - startedAt };
     } finally {
       this.active -= 1;
       this.waiting.shift()?.();
@@ -1043,10 +1062,12 @@ async function rankCandidateInventory(
   candidates: Candidate[],
   selector: LogoSelector,
   aiQueue: WorkQueue,
-): Promise<{ candidates: Candidate[]; retrievalRows: RetrievalReviewRow[] }> {
+): Promise<TextRankingResult> {
   const indexed = candidates.map((candidate, index) => ({ candidate, index: index + 1 }));
   const rankable = indexed.filter(({ candidate }) => !isFaviconCandidate(candidate));
   const shortlisted: Array<{ candidate: Candidate; index: number }> = [];
+  let queueWaitMs = 0;
+  let executionMs = 0;
   const retrievalRows = new Map<number, RetrievalReviewRow>(indexed.map(({ candidate, index }) => [index, retrievalRow(institution, seed, candidate, index, {
     batch_number: String(Math.floor((index - 1) / TEXT_RANK_BATCH_SIZE) + 1),
     status: isFaviconCandidate(candidate) ? "deferred_favicon" : "not_selected_by_text",
@@ -1054,7 +1075,7 @@ async function rankCandidateInventory(
   for (let offset = 0; offset < rankable.length; offset += TEXT_RANK_BATCH_SIZE) {
     const batch = rankable.slice(offset, offset + TEXT_RANK_BATCH_SIZE);
     const batchNumber = Math.floor(offset / TEXT_RANK_BATCH_SIZE) + 1;
-    const ranking = await aiQueue.run(() => selector.rankCandidates({
+    const timedRanking = await aiQueue.runWithTiming(() => selector.rankCandidates({
       institution,
       // Each model call uses its own 1..N indexes. Small local models often
       // answer relative to the visible batch even when given global indexes.
@@ -1068,6 +1089,9 @@ async function rankCandidateInventory(
         pageRegion: candidate.pageRegion,
       })),
     }));
+    queueWaitMs += timedRanking.queueWaitMs;
+    executionMs += timedRanking.executionMs;
+    const ranking = timedRanking.value;
     for (const [rank, localIndex] of ranking.candidateIndexes.entries()) {
       const entry = batch[localIndex - 1];
       if (entry && !shortlisted.some((item) => item.index === entry.index)) {
@@ -1077,15 +1101,15 @@ async function rankCandidateInventory(
       }
     }
   }
-  if (shortlisted.length === 0) return { candidates: [], retrievalRows: [...retrievalRows.values()] };
+  if (shortlisted.length === 0) return { candidates: [], retrievalRows: [...retrievalRows.values()], queueWaitMs, executionMs };
   if (shortlisted.length <= TEXT_RANK_RESULT_SIZE) {
     for (const [rank, entry] of shortlisted.entries()) {
       const row = retrievalRows.get(entry.index);
       if (row) retrievalRows.set(entry.index, { ...row, final_rank: String(rank + 1), status: "selected_for_visual" });
     }
-    return { candidates: shortlisted.map((entry) => entry.candidate), retrievalRows: [...retrievalRows.values()] };
+    return { candidates: shortlisted.map((entry) => entry.candidate), retrievalRows: [...retrievalRows.values()], queueWaitMs, executionMs };
   }
-  const finalRanking = await aiQueue.run(() => selector.rankCandidates({
+  const timedFinalRanking = await aiQueue.runWithTiming(() => selector.rankCandidates({
     institution,
     candidates: shortlisted.map(({ candidate }, localIndex) => ({
       index: localIndex + 1,
@@ -1097,13 +1121,16 @@ async function rankCandidateInventory(
       pageRegion: candidate.pageRegion,
     })),
   }));
+  queueWaitMs += timedFinalRanking.queueWaitMs;
+  executionMs += timedFinalRanking.executionMs;
+  const finalRanking = timedFinalRanking.value;
   const rankedCandidates = finalRanking.candidateIndexes.map((localIndex) => shortlisted[localIndex - 1]?.candidate).filter((candidate): candidate is Candidate => candidate !== undefined);
   for (const [rank, localIndex] of finalRanking.candidateIndexes.entries()) {
     const entry = shortlisted[localIndex - 1];
     const row = entry ? retrievalRows.get(entry.index) : undefined;
     if (entry && row) retrievalRows.set(entry.index, { ...row, final_rank: String(rank + 1), status: "selected_for_visual" });
   }
-  return { candidates: rankedCandidates, retrievalRows: [...retrievalRows.values()] };
+  return { candidates: rankedCandidates, retrievalRows: [...retrievalRows.values()], queueWaitMs, executionMs };
 }
 
 async function evaluateInstitution(
@@ -1113,8 +1140,15 @@ async function evaluateInstitution(
   selector: LogoSelector | null,
   aiQueue: WorkQueue | null,
 ): Promise<EvaluationResult> {
+  const startedAt = Date.now();
+  const timings = { discoveryMs: 0, textQueueWaitMs: 0, textExecutionMs: 0, conversionMs: 0, visionQueueWaitMs: 0, visionExecutionMs: 0, totalMs: 0 };
+  const complete = (reviewRows: ReviewRow[], retrievalRows: RetrievalReviewRow[]): EvaluationResult => ({
+    reviewRows,
+    retrievalRows,
+    timings: { ...timings, totalMs: Date.now() - startedAt },
+  });
   const website = normalizeUrl(institution.website);
-  if (!website) return { reviewRows: [reviewRow(institution, { run_seed: options.seed, status: "error", error: "Invalid website URL." })], retrievalRows: [] };
+  if (!website) return complete([reviewRow(institution, { run_seed: options.seed, status: "error", error: "Invalid website URL." })], []);
 
   const candidates = new Map<string, Candidate>();
   const pageQueue = [website];
@@ -1145,6 +1179,7 @@ async function evaluateInstitution(
       firstError ??= cleanError(error);
     }
   }
+  timings.discoveryMs = Date.now() - startedAt;
 
   const inventory = [...candidates.values()].slice(0, MAX_DISCOVERY_CANDIDATES);
   const primaryInventory = inventory.filter((candidate) => !isFaviconCandidate(candidate));
@@ -1171,13 +1206,12 @@ async function evaluateInstitution(
       const ranked = await rankCandidateInventory(institution, options.seed, inventory, selector, aiQueue);
       discoveryList = ranked.candidates;
       retrievalRows = ranked.retrievalRows;
+      timings.textQueueWaitMs = ranked.queueWaitMs;
+      timings.textExecutionMs = ranked.executionMs;
       if (discoveryList.length === 0 && faviconInventory.length > 0) useFaviconFallback();
     } catch (error) {
       const message = `Text candidate ranking failed: ${cleanError(error)}`;
-      return {
-        reviewRows: [reviewRow(institution, { run_seed: options.seed, status: "error", error: message })],
-        retrievalRows: retrievalRows.map((row) => ({ ...row, status: "text_ranking_error", error: message })),
-      };
+      return complete([reviewRow(institution, { run_seed: options.seed, status: "error", error: message })], retrievalRows.map((row) => ({ ...row, status: "text_ranking_error", error: message })));
     }
   } else {
     discoveryList = [...primaryInventory].sort((left, right) => right.initialScore - left.initialScore || left.key.localeCompare(right.key)).slice(0, TEXT_RANK_RESULT_SIZE);
@@ -1188,9 +1222,10 @@ async function evaluateInstitution(
     }
   }
   if (discoveryList.length === 0) {
-    return { reviewRows: [reviewRow(institution, { run_seed: options.seed, status: firstError ? "error" : "no_candidates", error: firstError ?? "No image candidates found." })], retrievalRows };
+    return complete([reviewRow(institution, { run_seed: options.seed, status: firstError ? "error" : "no_candidates", error: firstError ?? "No image candidates found." })], retrievalRows);
   }
 
+  const conversionStartedAt = Date.now();
   const convertCandidates = async (items: Candidate[]): Promise<CandidateResult[]> => {
     const converted: CandidateResult[] = [];
     for (const candidate of items) {
@@ -1223,8 +1258,9 @@ async function evaluateInstitution(
     useFaviconFallback();
     converted = await convertCandidates(discoveryList);
   }
+  timings.conversionMs = Date.now() - conversionStartedAt;
   if (converted.length === 0) {
-    return { reviewRows: [reviewRow(institution, { run_seed: options.seed, status: "no_candidates", error: "Discovered URLs did not yield downloadable images." })], retrievalRows };
+    return complete([reviewRow(institution, { run_seed: options.seed, status: "no_candidates", error: "Discovered URLs did not yield downloadable images." })], retrievalRows);
   }
 
   if (selector) {
@@ -1251,7 +1287,7 @@ async function evaluateInstitution(
   let aiError = "";
   if (selector && aiQueue) {
     try {
-      selection = await aiQueue.run(() => selector.select({
+      const timedSelection = await aiQueue.runWithTiming(() => selector.select({
         institution,
         allowFaviconFallback: usingFaviconFallback,
         candidates: selected.map((candidate, index) => ({
@@ -1263,6 +1299,9 @@ async function evaluateInstitution(
           metadata: candidate.candidate.metadata,
         })),
       }));
+      selection = timedSelection.value;
+      timings.visionQueueWaitMs = timedSelection.queueWaitMs;
+      timings.visionExecutionMs = timedSelection.executionMs;
       const selectionResult = selection;
       const chosenAssessment = selectionResult.candidateIndex === null
         ? null
@@ -1316,7 +1355,7 @@ async function evaluateInstitution(
       ai_eligible: assessment ? String(assessment.eligible) : "",
     }));
   }
-  return { reviewRows: rows, retrievalRows };
+  return complete(rows, retrievalRows);
 }
 
 function seededRandom(seed: string): () => number {
@@ -1580,6 +1619,10 @@ async function resetReview(options: Options): Promise<void> {
   console.log(`Removed ${OUTPUT_DIR}`);
 }
 
+function formatSeconds(milliseconds: number): string {
+  return `${(milliseconds / 1_000).toFixed(2)}s`;
+}
+
 async function main(): Promise<void> {
   const options = parseOptions(process.argv.slice(2));
   if (options.resetReview) {
@@ -1630,7 +1673,8 @@ async function main(): Promise<void> {
   const batches = await mapLimit(institutions, options.concurrency, async (institution) => {
     const result = await evaluateInstitution(institution, options, limiter, selector, aiQueue);
     completed += 1;
-    console.log(`Evaluated ${completed}/${institutions.length}: ${institution.name}`);
+    const timing = result.timings;
+    console.log(`Evaluated ${completed}/${institutions.length}: ${institution.name} [discovery ${formatSeconds(timing.discoveryMs)} | text queue ${formatSeconds(timing.textQueueWaitMs)} + run ${formatSeconds(timing.textExecutionMs)} | conversion ${formatSeconds(timing.conversionMs)} | vision queue ${formatSeconds(timing.visionQueueWaitMs)} + run ${formatSeconds(timing.visionExecutionMs)} | total ${formatSeconds(timing.totalMs)}]`);
     return result;
   });
   const rows = batches.flatMap((result) => result.reviewRows);
@@ -1643,6 +1687,16 @@ async function main(): Promise<void> {
   for (const row of rows) statusCounts.set(row.status, (statusCounts.get(row.status) ?? 0) + 1);
   console.log("Summary");
   for (const [status, count] of [...statusCounts.entries()].sort(([left], [right]) => left.localeCompare(right))) console.log(`  ${status}: ${count}`);
+  const timingTotals = batches.reduce((total, result) => ({
+    discoveryMs: total.discoveryMs + result.timings.discoveryMs,
+    textQueueWaitMs: total.textQueueWaitMs + result.timings.textQueueWaitMs,
+    textExecutionMs: total.textExecutionMs + result.timings.textExecutionMs,
+    conversionMs: total.conversionMs + result.timings.conversionMs,
+    visionQueueWaitMs: total.visionQueueWaitMs + result.timings.visionQueueWaitMs,
+    visionExecutionMs: total.visionExecutionMs + result.timings.visionExecutionMs,
+    totalMs: total.totalMs + result.timings.totalMs,
+  }), { discoveryMs: 0, textQueueWaitMs: 0, textExecutionMs: 0, conversionMs: 0, visionQueueWaitMs: 0, visionExecutionMs: 0, totalMs: 0 });
+  console.log(`Timing totals (sum across schools): discovery ${formatSeconds(timingTotals.discoveryMs)} | text queue ${formatSeconds(timingTotals.textQueueWaitMs)} + run ${formatSeconds(timingTotals.textExecutionMs)} | conversion ${formatSeconds(timingTotals.conversionMs)} | vision queue ${formatSeconds(timingTotals.visionQueueWaitMs)} + run ${formatSeconds(timingTotals.visionExecutionMs)} | total ${formatSeconds(timingTotals.totalMs)}`);
   if (options.apply) {
     const result = await applyAcceptedSelections(rows);
     console.log(`Remote changes: ${result.uploaded} logo${result.uploaded === 1 ? "" : "s"} uploaded and recorded; ${result.skipped} evaluation row${result.skipped === 1 ? "" : "s"} not applied.`);
