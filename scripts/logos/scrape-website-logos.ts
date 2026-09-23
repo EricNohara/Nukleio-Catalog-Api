@@ -1,15 +1,17 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { parse } from "csv-parse/sync";
 import sharp, { type Metadata } from "sharp";
+import { OllamaLogoSelector, type LogoCandidateKind, type LogoSelection, type LogoSelector } from "./logo-selector.js";
 
 const execFileAsync = promisify(execFile);
 
 const REPOSITORY_ROOT = path.resolve(import.meta.dirname, "../..");
 const DATABASE_NAME = "nukleio-catalog";
+const R2_BUCKET_NAME = "nukleio-catalog-assets";
 const OUTPUT_DIR = path.join(REPOSITORY_ROOT, "data", "logos");
 const REVIEW_CSV = path.join(OUTPUT_DIR, "logo-review.csv");
 const MANIFEST_CSV = path.join(OUTPUT_DIR, "logo-manifest.csv");
@@ -23,6 +25,11 @@ const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_MAX_PAGES = 4;
 const DEFAULT_MAX_CANDIDATES = 5;
 const DEFAULT_MIN_SCORE = 75;
+const DEFAULT_AI_MODEL = "qwen3-vl:4b";
+const DEFAULT_AI_THRESHOLD = 0.8;
+const DEFAULT_AI_CONCURRENCY = 1;
+const DEFAULT_AI_KEEP_ALIVE = "30m";
+const DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434";
 const MAX_DISCOVERY_CANDIDATES = 24;
 const MAX_HTML_BYTES = 2 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
@@ -43,12 +50,20 @@ type Institution = {
 
 type Options = {
   limit: number;
+  seed: string;
   concurrency: number;
   perHostDelayMs: number;
   timeoutMs: number;
   maxPages: number;
   maxCandidates: number;
   minScore: number;
+  aiEnabled: boolean;
+  aiModel: string;
+  aiThreshold: number;
+  aiConcurrency: number;
+  ollamaUrl: string;
+  aiKeepAlive: string;
+  apply: boolean;
   refreshFailed: boolean;
   renderReview: boolean;
   resetReview: boolean;
@@ -62,12 +77,15 @@ type Candidate = {
   url: string | null;
   inlineSvg: string | null;
   source: string;
+  metadata: string;
+  qualification: "strong" | "fallback";
   initialScore: number;
   reasons: string[];
 };
 
 type ReviewRow = {
   institution_id: string;
+  run_seed: string;
   institution_name: string;
   normalized_name: string;
   category: string;
@@ -87,6 +105,15 @@ type ReviewRow = {
   width: string;
   height: string;
   reasons: string;
+  candidate_metadata: string;
+  ai_choice: string;
+  ai_confidence: string;
+  ai_reason: string;
+  ai_model: string;
+  ai_status: string;
+  ai_duration_ms: string;
+  ai_kind: string;
+  ai_eligible: string;
   error: string;
 };
 
@@ -103,14 +130,17 @@ type CandidateResult = {
   finalUrl: string;
 };
 
+const ACCEPTABLE_AI_KINDS = new Set<LogoCandidateKind>(["logo", "wordmark", "seal", "crest"]);
+
 const MANIFEST_HEADER = [
-  "institution_id", "institution_name", "normalized_name", "category", "city", "state", "website",
+  "institution_id", "run_seed", "institution_name", "normalized_name", "category", "city", "state", "website",
   "source_page_url", "candidate_url", "preview_path", "candidate_rank", "score", "auto_selected",
-  "status", "content_type", "source_bytes", "preview_bytes", "width", "height", "reasons", "error",
+  "status", "content_type", "source_bytes", "preview_bytes", "width", "height", "reasons", "candidate_metadata",
+  "ai_choice", "ai_confidence", "ai_reason", "ai_model", "ai_status", "ai_duration_ms", "ai_kind", "ai_eligible", "error",
 ] as const;
 
 const REVIEW_HEADER = [
-  "institution_name", "category", "website", "candidate_rank", "score", "auto_selected", "status", "candidate_url", "error",
+  "institution_name", "category", "website", "candidate_rank", "score", "auto_selected", "ai_kind", "ai_eligible", "ai_choice", "ai_confidence", "ai_status", "candidate_url", "error",
 ] as const;
 
 const POSITIVE_TOKENS: Array<[string, number]> = [
@@ -134,16 +164,24 @@ changes D1 or R2.
 
 Options:
   --limit <count>              Schools to evaluate; balanced across categories (default: ${DEFAULT_LIMIT})
+  --seed <value>               Reproduce the random school sample; printed when omitted
   --concurrency <count>        Concurrent school evaluations (default: ${DEFAULT_CONCURRENCY})
   --per-host-delay-ms <ms>     Minimum delay between requests to one host (default: ${DEFAULT_PER_HOST_DELAY_MS})
   --timeout-ms <ms>            Per-request timeout (default: ${DEFAULT_TIMEOUT_MS})
   --max-pages <count>          Homepage plus relevant same-site pages; 1-4 (default: ${DEFAULT_MAX_PAGES})
   --max-candidates <count>     Downloaded WebP previews per school; 1-5 (default: ${DEFAULT_MAX_CANDIDATES})
   --min-score <score>          Score needed to mark rank 1 as auto-selected; 0-100 (default: ${DEFAULT_MIN_SCORE})
+  --no-ai                      Skip local AI selection and retain deterministic rank-1 selection
+  --ai-model <name>            Ollama vision model (default: ${DEFAULT_AI_MODEL})
+  --ai-threshold <0..1>        Minimum AI confidence to auto-select (default: ${DEFAULT_AI_THRESHOLD})
+  --ai-concurrency <count>     Concurrent AI requests; use 1 for a 6 GB GPU (default: ${DEFAULT_AI_CONCURRENCY})
+  --ollama-url <url>           Local Ollama endpoint (default: ${DEFAULT_OLLAMA_URL})
+  --ai-keep-alive <duration>   Keep the model warm, e.g. 30m (default: ${DEFAULT_AI_KEEP_ALIVE})
+  --apply                      Upload accepted AI selections to R2 and set remote D1 logo_key
   --refresh-failed             Retry schools previously recorded only as errors or no-candidate results
   --render-review              Rebuild the compact CSV and visual HTML review from the local manifest
   --reset-review               Delete local manifests, review files, and previews under data/logos
-  --yes                        Required with --reset-review
+  --yes                        Required with --reset-review or --apply
 `);
   process.exit(0);
 }
@@ -152,12 +190,20 @@ function parseOptions(argv: string[]): Options {
   if (argv.includes("--help") || argv.includes("-h")) usage();
 
   let limit = DEFAULT_LIMIT;
+  let seed: string = randomUUID();
   let concurrency = DEFAULT_CONCURRENCY;
   let perHostDelayMs = DEFAULT_PER_HOST_DELAY_MS;
   let timeoutMs = DEFAULT_TIMEOUT_MS;
   let maxPages = DEFAULT_MAX_PAGES;
   let maxCandidates = DEFAULT_MAX_CANDIDATES;
   let minScore = DEFAULT_MIN_SCORE;
+  let aiEnabled = true;
+  let aiModel = DEFAULT_AI_MODEL;
+  let aiThreshold = DEFAULT_AI_THRESHOLD;
+  let aiConcurrency = DEFAULT_AI_CONCURRENCY;
+  let ollamaUrl = DEFAULT_OLLAMA_URL;
+  let aiKeepAlive = DEFAULT_AI_KEEP_ALIVE;
+  let apply = false;
   let refreshFailed = false;
   let renderReview = false;
   let resetReview = false;
@@ -181,12 +227,31 @@ function parseOptions(argv: string[]): Options {
       yes = true;
       continue;
     }
-    if (["--limit", "--concurrency", "--per-host-delay-ms", "--timeout-ms", "--max-pages", "--max-candidates", "--min-score"].includes(argument)) {
+    if (argument === "--no-ai") {
+      aiEnabled = false;
+      continue;
+    }
+    if (argument === "--apply") {
+      apply = true;
+      continue;
+    }
+    if (["--seed", "--ai-model", "--ollama-url", "--ai-keep-alive"].includes(argument)) {
+      const value = argv[index + 1];
+      if (!value || value.startsWith("--")) throw new Error(`${argument} requires a value.`);
+      index += 1;
+      if (argument === "--seed") seed = value;
+      if (argument === "--ai-model") aiModel = value;
+      if (argument === "--ollama-url") ollamaUrl = value;
+      if (argument === "--ai-keep-alive") aiKeepAlive = value;
+      continue;
+    }
+    if (["--limit", "--concurrency", "--per-host-delay-ms", "--timeout-ms", "--max-pages", "--max-candidates", "--min-score", "--ai-threshold", "--ai-concurrency"].includes(argument)) {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) throw new Error(`${argument} requires a value.`);
       index += 1;
       const number = Number(value);
-      if (!Number.isInteger(number)) throw new Error(`${argument} must be an integer.`);
+      if (!Number.isFinite(number)) throw new Error(`${argument} must be a number.`);
+      if (argument !== "--ai-threshold" && !Number.isInteger(number)) throw new Error(`${argument} must be an integer.`);
       if (argument === "--limit") limit = number;
       if (argument === "--concurrency") concurrency = number;
       if (argument === "--per-host-delay-ms") perHostDelayMs = number;
@@ -194,6 +259,8 @@ function parseOptions(argv: string[]): Options {
       if (argument === "--max-pages") maxPages = number;
       if (argument === "--max-candidates") maxCandidates = number;
       if (argument === "--min-score") minScore = number;
+      if (argument === "--ai-threshold") aiThreshold = number;
+      if (argument === "--ai-concurrency") aiConcurrency = number;
       continue;
     }
     throw new Error(`Unknown option: ${argument}`);
@@ -203,7 +270,12 @@ function parseOptions(argv: string[]): Options {
   if (maxPages < 1 || maxPages > 4) throw new Error("--max-pages must be between 1 and 4.");
   if (maxCandidates < 1 || maxCandidates > 5) throw new Error("--max-candidates must be between 1 and 5.");
   if (minScore < 0 || minScore > 100) throw new Error("--min-score must be between 0 and 100.");
-  return { limit, concurrency, perHostDelayMs, timeoutMs, maxPages, maxCandidates, minScore, refreshFailed, renderReview, resetReview, yes };
+  if (aiThreshold < 0 || aiThreshold > 1) throw new Error("--ai-threshold must be between 0 and 1.");
+  if (aiConcurrency < 1) throw new Error("--ai-concurrency must be positive.");
+  if (apply && !yes) throw new Error("--apply requires --yes because it uploads to remote R2 and updates remote D1.");
+  if (apply && !aiEnabled) throw new Error("--apply requires AI selection; remove --no-ai.");
+  if (apply && (renderReview || resetReview)) throw new Error("--apply cannot be combined with --render-review or --reset-review.");
+  return { limit, seed, concurrency, perHostDelayMs, timeoutMs, maxPages, maxCandidates, minScore, aiEnabled, aiModel, aiThreshold, aiConcurrency, ollamaUrl, aiKeepAlive, apply, refreshFailed, renderReview, resetReview, yes };
 }
 
 function csvValue(value: string | number | boolean | null): string {
@@ -235,6 +307,46 @@ async function queryLocal<T>(sql: string): Promise<T[]> {
   const payload = JSON.parse(output) as Array<{ results?: T[]; success?: boolean }>;
   if (!payload[0]?.success || !payload[0].results) throw new Error("Wrangler returned an unsuccessful local D1 query.");
   return payload[0].results;
+}
+
+async function queryRemote<T>(sql: string): Promise<T[]> {
+  const output = await runWrangler(["d1", "execute", DATABASE_NAME, "--remote", "--json", "--command", sql]);
+  const payload = JSON.parse(output) as Array<{ results?: T[]; success?: boolean }>;
+  if (!payload[0]?.success || !payload[0].results) throw new Error("Wrangler returned an unsuccessful remote D1 query.");
+  return payload[0].results;
+}
+
+function sqlValue(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+function r2KeyFor(row: ReviewRow): string {
+  const category = row.category === "college" ? "colleges" : "high-schools";
+  return `education/${category}/${row.institution_id}.webp`;
+}
+
+async function applyAcceptedSelections(rows: ReviewRow[]): Promise<{ uploaded: number; skipped: number }> {
+  const accepted = rows.filter((row) => isAutoSelected(row) && row.preview_path && row.ai_status === "accepted");
+  let uploaded = 0;
+  let skipped = rows.length - accepted.length;
+  for (const row of accepted) {
+    const current = await queryRemote<{ logo_key: string | null }>(`SELECT logo_key FROM educational_institutions WHERE id = ${sqlValue(row.institution_id)} LIMIT 1;`);
+    if (current.length === 0 || current[0]?.logo_key?.trim()) {
+      skipped += 1;
+      console.log(`Skipped unavailable or already-enriched institution: ${row.institution_name}`);
+      continue;
+    }
+    const previewPath = path.resolve(REPOSITORY_ROOT, row.preview_path);
+    const objectKey = r2KeyFor(row);
+    await runWrangler(["r2", "object", "put", `${R2_BUCKET_NAME}/${objectKey}`, "--file", previewPath, "--remote"]);
+    await runWrangler([
+      "d1", "execute", DATABASE_NAME, "--remote", "--command",
+      `UPDATE educational_institutions SET logo_key = ${sqlValue(objectKey)} WHERE id = ${sqlValue(row.institution_id)} AND (logo_key IS NULL OR TRIM(logo_key) = '');`,
+    ]);
+    uploaded += 1;
+    console.log(`Applied ${uploaded}/${accepted.length}: ${row.institution_name}`);
+  }
+  return { uploaded, skipped };
 }
 
 function normalizeUrl(value: string, base?: string): string | null {
@@ -300,7 +412,30 @@ function hasPositiveLogoSignal(value: string): boolean {
 }
 
 function rejectedAsset(value: string): boolean {
-  return /recaptcha|gstatic\.com|wp-includes\/images\/w-logo|(?:social.*sprite|sprite.*social)|(?:facebook|twitter|linkedin)[-_]?button/i.test(value);
+  return /recaptcha|gstatic\.com|wp-includes\/images\/w-logo|(?:social.*sprite|sprite.*social)|(?:facebook|twitter|linkedin)[-_]?button|powered\s+by\s+edlio|\bedlio\b|\baeries\b|google[-_ ]?translate|(?:search|menu|close)[-_ ]?icon/i.test(value);
+}
+
+function assetSignalText(url: string, metadata: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.pathname} ${parsed.search} ${metadata}`.toLowerCase();
+  } catch {
+    return metadata.toLowerCase();
+  }
+}
+
+function hasDirectLogoSignal(url: string, metadata: string): boolean {
+  return /(?:^|[\s_\-./])(?:logo|wordmark|brand(?:ing)?|identity|emblem|crest|seal)(?:$|[\s_\-./])/i.test(assetSignalText(url, metadata));
+}
+
+function likelyNonLogoAsset(value: string): boolean {
+  return /(?:^|[\s_\-./])(staff|portrait|headshot|team|faculty|people|gallery|slideshow|timeline|infographic|report|brochure|flyer|calendar|newsletter|hero|cover|background)(?:$|[\s_\-./])/i.test(value);
+}
+
+function inlineSvgHasDirectLogoContext(context: string): boolean {
+  const nearby = context.slice(-500).toLowerCase();
+  if (rejectedAsset(nearby)) return false;
+  return /(?:school|site|header|brand|main)[_-]?logo|logo[-_ ]?(?:image|container|wrapper|link)|\bclass\s*=\s*["'][^"']*\blogo\b/i.test(nearby);
 }
 
 function institutionMatchScore(institution: Institution, value: string): { score: number; reasons: string[] } {
@@ -351,15 +486,18 @@ function addImageCandidate(
   if (!rawUrl) return;
   const url = normalizeUrl(rawUrl, pageUrl);
   if (!url) return;
-  if (rejectedAsset(`${url} ${signalText}`)) return;
+  const assetText = assetSignalText(url, signalText);
+  if (rejectedAsset(assetText)) return;
+  if (likelyNonLogoAsset(assetText)) return;
   const urlSignals = tokenScore(url);
   const contextSignals = tokenScore(signalText);
-  const institutionSignals = institutionMatchScore(institution, `${url} ${signalText}`);
+  const institutionSignals = institutionMatchScore(institution, assetText);
   const structureSignals = structuralScore(structuralContext);
   const genericImageSource = source === "image-element" || source === "picture-source" || source === "css-background";
-  const explicitSignal = hasPositiveLogoSignal(`${url} ${signalText}`) || institutionSignals.score > 0 || structureSignals.score > 0;
-  if (source === "css-background" && !explicitSignal) return;
-  if ((source === "image-element" || source === "picture-source") && !explicitSignal) return;
+  const explicitSignal = hasDirectLogoSignal(url, signalText);
+  const fallbackSource = source === "document-icon" || source === "web-manifest" || source === "favicon-fallback";
+  if (genericImageSource && !explicitSignal) return;
+  if (!genericImageSource && !fallbackSource && !explicitSignal) return;
   const contextScore = genericImageSource ? Math.trunc(contextSignals.score * 0.35) : contextSignals.score;
   addCandidate(candidates, {
     institution,
@@ -368,6 +506,8 @@ function addImageCandidate(
     url,
     inlineSvg: null,
     source,
+    metadata: signalText.replace(/\s+/g, " ").trim().slice(0, 500),
+    qualification: explicitSignal ? "strong" : "fallback",
     initialScore: baseScore + urlSignals.score + contextScore + institutionSignals.score + structureSignals.score,
     reasons: [
       `source:${source}`,
@@ -381,11 +521,13 @@ function addImageCandidate(
 
 function addInlineSvgCandidate(candidates: Map<string, Candidate>, institution: Institution, pageUrl: string, svg: string, context: string): void {
   const svgTitle = svg.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1]?.replace(/<[^>]*>/g, " ") ?? "";
-  const signals = `${svgTitle} ${context}`;
+  if (!inlineSvgHasDirectLogoContext(context)) return;
+  const signals = `${svgTitle} ${context.slice(-500)}`;
+  if (rejectedAsset(signals)) return;
   const tokenSignals = tokenScore(signals);
   const institutionSignals = institutionMatchScore(institution, signals);
   const structureSignals = structuralScore(context);
-  if (!hasPositiveLogoSignal(signals) && institutionSignals.score === 0 && structureSignals.score === 0) return;
+  if (!hasPositiveLogoSignal(signals) && institutionSignals.score === 0) return;
   const key = `inline-svg:${createHash("sha256").update(pageUrl).update(svg).digest("hex")}`;
   addCandidate(candidates, {
     institution,
@@ -394,6 +536,8 @@ function addInlineSvgCandidate(candidates: Map<string, Candidate>, institution: 
     url: null,
     inlineSvg: svg,
     source: "inline-svg",
+    metadata: signals.replace(/\s+/g, " ").trim().slice(0, 500),
+    qualification: "strong",
     initialScore: 65 + tokenSignals.score + institutionSignals.score + structureSignals.score,
     reasons: ["source:inline-svg", ...tokenSignals.reasons, ...institutionSignals.reasons, ...structureSignals.reasons],
   });
@@ -494,6 +638,24 @@ class HostLimiter {
       return await action();
     } finally {
       release();
+    }
+  }
+}
+
+class WorkQueue {
+  private active = 0;
+  private readonly waiting: Array<() => void> = [];
+
+  constructor(private readonly concurrency: number) {}
+
+  async run<T>(action: () => Promise<T>): Promise<T> {
+    if (this.active >= this.concurrency) await new Promise<void>((resolve) => this.waiting.push(resolve));
+    this.active += 1;
+    try {
+      return await action();
+    } finally {
+      this.active -= 1;
+      this.waiting.shift()?.();
     }
   }
 }
@@ -632,6 +794,7 @@ function previewFileName(institutionId: string, rank: number): string {
 function reviewRow(institution: Institution, overrides: Partial<ReviewRow>): ReviewRow {
   return {
     institution_id: institution.id,
+    run_seed: "",
     institution_name: institution.name,
     normalized_name: institution.normalized_name,
     category: institution.category,
@@ -651,12 +814,27 @@ function reviewRow(institution: Institution, overrides: Partial<ReviewRow>): Rev
     width: "",
     height: "",
     reasons: "",
+    candidate_metadata: "",
+    ai_choice: "",
+    ai_confidence: "",
+    ai_reason: "",
+    ai_model: "",
+    ai_status: "not_run",
+    ai_duration_ms: "",
+    ai_kind: "",
+    ai_eligible: "",
     error: "",
     ...overrides,
   };
 }
 
-async function evaluateInstitution(institution: Institution, options: Options, limiter: HostLimiter): Promise<ReviewRow[]> {
+async function evaluateInstitution(
+  institution: Institution,
+  options: Options,
+  limiter: HostLimiter,
+  selector: LogoSelector | null,
+  aiQueue: WorkQueue | null,
+): Promise<ReviewRow[]> {
   const website = normalizeUrl(institution.website);
   if (!website) return [reviewRow(institution, { status: "error", error: "Invalid website URL." })];
 
@@ -675,8 +853,11 @@ async function evaluateInstitution(institution: Institution, options: Options, l
       if (visited.size === 1) rootUrl = page.finalUrl;
       const discovered = discoverHtmlCandidates(institution, page.html, page.finalUrl);
       for (const candidate of discovered.candidates) addCandidate(candidates, candidate);
-      for (const link of relevantLinks(page.html, page.finalUrl, rootUrl)) {
-        if (!visited.has(link) && !pageQueue.includes(link) && pageQueue.length + visited.size < options.maxPages) pageQueue.push(link);
+      const hasStrongCandidate = [...candidates.values()].some((candidate) => candidate.qualification === "strong");
+      if (!hasStrongCandidate) {
+        for (const link of relevantLinks(page.html, page.finalUrl, rootUrl)) {
+          if (!visited.has(link) && !pageQueue.includes(link) && pageQueue.length + visited.size < options.maxPages) pageQueue.push(link);
+        }
       }
       for (const manifestUrl of discovered.manifestUrls.slice(0, 2)) {
         try {
@@ -690,9 +871,12 @@ async function evaluateInstitution(institution: Institution, options: Options, l
     }
   }
 
-  const discoveryList = [...candidates.values()]
-    .sort((left, right) => right.initialScore - left.initialScore || left.key.localeCompare(right.key))
-    .slice(0, MAX_DISCOVERY_CANDIDATES);
+  const allCandidates = [...candidates.values()];
+  const strongCandidates = allCandidates.filter((candidate) => candidate.qualification === "strong")
+    .sort((left, right) => right.initialScore - left.initialScore || left.key.localeCompare(right.key));
+  const fallbackCandidates = allCandidates.filter((candidate) => candidate.qualification === "fallback")
+    .sort((left, right) => right.initialScore - left.initialScore || left.key.localeCompare(right.key));
+  const discoveryList = (strongCandidates.length > 0 ? strongCandidates : fallbackCandidates).slice(0, MAX_DISCOVERY_CANDIDATES);
   if (discoveryList.length === 0) {
     return [reviewRow(institution, { status: firstError ? "error" : "no_candidates", error: firstError ?? "No image candidates found." })];
   }
@@ -726,19 +910,65 @@ async function evaluateInstitution(institution: Institution, options: Options, l
   }
 
   converted.sort((left, right) => right.score - left.score || left.finalUrl.localeCompare(right.finalUrl));
-  const selected = converted.slice(0, options.maxCandidates);
+  const uniqueConverted = new Map<string, CandidateResult>();
+  for (const candidate of converted) {
+    const fingerprint = createHash("sha256").update(candidate.preview).digest("hex");
+    if (!uniqueConverted.has(fingerprint)) uniqueConverted.set(fingerprint, candidate);
+  }
+  const selected = [...uniqueConverted.values()].slice(0, options.maxCandidates);
+  for (const [index, candidate] of selected.entries()) {
+    await writeFile(path.join(PREVIEW_DIR, previewFileName(institution.id, index + 1)), candidate.preview);
+  }
+
+  let selection: LogoSelection | null = null;
+  let aiStatus = selector ? "error" : "disabled";
+  let aiError = "";
+  if (selector && aiQueue) {
+    try {
+      selection = await aiQueue.run(() => selector.select({
+        institution,
+        candidates: selected.map((candidate, index) => ({
+          index: index + 1,
+          previewPath: path.join(PREVIEW_DIR, previewFileName(institution.id, index + 1)),
+          source: candidate.candidate.source,
+          sourcePageUrl: candidate.candidate.sourcePageUrl,
+          candidateUrl: candidate.finalUrl,
+          metadata: candidate.candidate.metadata,
+        })),
+      }));
+      const selectionResult = selection;
+      const chosenAssessment = selectionResult.candidateIndex === null
+        ? null
+        : selectionResult.assessments.find((assessment) => assessment.index === selectionResult.candidateIndex) ?? null;
+      aiStatus = selectionResult.candidateIndex === null
+        ? "no_match"
+        : !chosenAssessment?.eligible || !ACCEPTABLE_AI_KINDS.has(chosenAssessment.kind)
+          ? "rejected_kind"
+          : selectionResult.confidence >= options.aiThreshold ? "accepted" : "below_threshold";
+    } catch (error) {
+      aiError = cleanError(error);
+    }
+  }
+  const aiAcceptedRank = selection && selection.candidateIndex !== null && selection.confidence >= options.aiThreshold
+    && (() => {
+      const assessment = selection.assessments.find((item) => item.index === selection.candidateIndex);
+      return assessment?.eligible === true && ACCEPTABLE_AI_KINDS.has(assessment.kind);
+    })()
+    ? selection.candidateIndex
+    : null;
   const rows: ReviewRow[] = [];
   for (const [index, candidate] of selected.entries()) {
     const rank = index + 1;
     const filePath = path.join(PREVIEW_DIR, previewFileName(institution.id, rank));
-    await writeFile(filePath, candidate.preview);
+    const assessment = selection?.assessments.find((item) => item.index === rank);
     rows.push(reviewRow(institution, {
+      run_seed: options.seed,
       source_page_url: candidate.candidate.sourcePageUrl,
       candidate_url: candidate.finalUrl,
       preview_path: path.relative(REPOSITORY_ROOT, filePath).replaceAll(path.sep, "/"),
       candidate_rank: String(rank),
       score: String(candidate.score),
-      auto_selected: String(rank === 1 && candidate.score >= options.minScore),
+      auto_selected: String(selector ? rank === aiAcceptedRank : rank === 1 && candidate.score >= options.minScore),
       status: "candidate",
       content_type: candidate.contentType,
       source_bytes: String(candidate.sourceBytes),
@@ -746,15 +976,35 @@ async function evaluateInstitution(institution: Institution, options: Options, l
       width: String(candidate.width),
       height: String(candidate.height),
       reasons: candidate.reasons.join(";"),
+      candidate_metadata: candidate.candidate.metadata,
+      ai_choice: selection?.candidateIndex === null ? "none" : String(selection?.candidateIndex ?? ""),
+      ai_confidence: selection ? selection.confidence.toFixed(2) : "",
+      ai_reason: selection?.reason ?? aiError,
+      ai_model: selection?.model ?? (selector ? options.aiModel : ""),
+      ai_status: aiStatus,
+      ai_duration_ms: selection ? String(selection.durationMs) : "",
+      ai_kind: assessment?.kind ?? "",
+      ai_eligible: assessment ? String(assessment.eligible) : "",
     }));
   }
   return rows;
 }
 
-function shuffle<T>(values: T[]): T[] {
+function seededRandom(seed: string): () => number {
+  let state = createHash("sha256").update(seed).digest().readUInt32LE(0);
+  return () => {
+    state += 0x6D2B79F5;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
+  };
+}
+
+function shuffle<T>(values: T[], random: () => number): T[] {
   const result = [...values];
   for (let index = result.length - 1; index > 0; index -= 1) {
-    const randomIndex = Math.floor(Math.random() * (index + 1));
+    const randomIndex = Math.floor(random() * (index + 1));
     [result[index], result[randomIndex]] = [result[randomIndex], result[index]];
   }
   return result;
@@ -762,7 +1012,16 @@ function shuffle<T>(values: T[]): T[] {
 
 async function readManifestRows(): Promise<ReviewRow[]> {
   try {
-    return parse(await readFile(MANIFEST_CSV, "utf8"), { columns: true, bom: true, skip_empty_lines: true }) as ReviewRow[];
+    const rows = parse(await readFile(MANIFEST_CSV, "utf8"), { columns: true, bom: true, skip_empty_lines: true }) as Array<Record<string, string>>;
+    return rows.map((row) => reviewRow({
+      id: row.institution_id,
+      name: row.institution_name ?? "",
+      normalized_name: row.normalized_name ?? "",
+      category: row.category === "college" ? "college" : "high_school",
+      city: row.city || null,
+      state: row.state || null,
+      website: row.website ?? "",
+    }, row));
   } catch {
     return [];
   }
@@ -787,19 +1046,22 @@ WHERE (logo_key IS NULL OR TRIM(logo_key) = '')
   AND website IS NOT NULL
   AND TRIM(website) <> '';`);
   const eligible = institutions.filter((institution) => !existing.has(institution.id));
-  const collegePool = shuffle(eligible.filter((institution) => institution.category === "college"));
-  const highSchoolPool = shuffle(eligible.filter((institution) => institution.category === "high_school"));
+  const random = seededRandom(options.seed);
+  const collegePool = shuffle(eligible.filter((institution) => institution.category === "college"), random);
+  const highSchoolPool = shuffle(eligible.filter((institution) => institution.category === "high_school"), random);
   const half = Math.floor(options.limit / 2);
   const selected = [...collegePool.slice(0, half), ...highSchoolPool.slice(0, half)];
   const selectedIds = new Set(selected.map((institution) => institution.id));
-  const remainderPool = shuffle(eligible.filter((institution) => !selectedIds.has(institution.id)));
-  return shuffle([...selected, ...remainderPool.slice(0, options.limit - selected.length)]);
+  const remainderPool = shuffle(eligible.filter((institution) => !selectedIds.has(institution.id)), random);
+  return shuffle([...selected, ...remainderPool.slice(0, options.limit - selected.length)], random);
 }
 
 async function ensureOutput(): Promise<void> {
   await mkdir(PREVIEW_DIR, { recursive: true });
   try {
-    await readFile(MANIFEST_CSV, "utf8");
+    const manifest = await readFile(MANIFEST_CSV, "utf8");
+    const header = manifest.split(/\r?\n/, 1)[0]?.replace(/^\uFEFF/, "").split(",") ?? [];
+    if (!MANIFEST_HEADER.every((column) => header.includes(column))) await writeManifestRows(await readManifestRows());
   } catch {
     const legacyRows = await readLegacyReviewRows();
     if (legacyRows.length > 0) {
@@ -863,6 +1125,11 @@ async function writeReviewArtifacts(rows: ReviewRow[]): Promise<void> {
     row.candidate_rank,
     row.score,
     row.auto_selected,
+    row.ai_kind,
+    row.ai_eligible,
+    row.ai_choice,
+    row.ai_confidence,
+    row.ai_status,
     row.status,
     row.candidate_url,
     row.error,
@@ -872,6 +1139,9 @@ async function writeReviewArtifacts(rows: ReviewRow[]): Promise<void> {
   for (const row of rows) byInstitution.set(row.institution_id, [...(byInstitution.get(row.institution_id) ?? []), row]);
   const cards = [...byInstitution.values()].map((group) => {
     const first = group[0];
+    const schoolDecision = first.ai_status && first.ai_status !== "disabled" && first.ai_status !== "not_run"
+      ? `<p class="school-decision">AI choice: <strong>${escapeHtml(first.ai_choice || "none")}</strong> · confidence ${escapeHtml(first.ai_confidence || "—")} · ${escapeHtml(first.ai_status)}${first.ai_reason ? ` — ${escapeHtml(first.ai_reason)}` : ""}</p>`
+      : "";
     const candidates = group.map((row) => {
       const previewUrl = reviewPreviewUrl(row);
       const image = previewUrl
@@ -880,24 +1150,28 @@ async function writeReviewArtifacts(rows: ReviewRow[]): Promise<void> {
       const candidateLink = row.candidate_url
         ? `<a href="${escapeHtml(row.candidate_url)}" target="_blank" rel="noreferrer">Open candidate source</a>`
         : "";
-      const selected = isAutoSelected(row) ? `<span class="selected">Auto-selected</span>` : "";
+      const selected = isAutoSelected(row) ? `<span class="selected">AI selected</span>` : "";
       const score = row.score ? `<span>Score ${escapeHtml(row.score)}</span>` : "";
+      const aiAssessment = row.ai_kind
+        ? `<span class="ai-decision">AI: ${escapeHtml(row.ai_kind)} · ${row.ai_eligible === "true" ? "eligible" : "rejected"}</span>`
+        : "";
       const error = row.error ? `<p class="error">${escapeHtml(row.error)}</p>` : "";
       return `<article class="candidate">
   ${image}
-  <div class="candidate-meta"><strong>Candidate ${escapeHtml(row.candidate_rank || "—")}</strong>${selected}${score}${candidateLink}</div>
+  <div class="candidate-meta"><strong>Candidate ${escapeHtml(row.candidate_rank || "—")}</strong>${selected}${score}${aiAssessment}${candidateLink}</div>
   ${error}
 </article>`;
     }).join("\n");
     return `<section class="school">
-  <header><h2>${escapeHtml(first.institution_name)}</h2><span>${escapeHtml(first.category)}</span><a href="${escapeHtml(first.website)}" target="_blank" rel="noreferrer">Open school website</a></header>
+  <header><h2>${escapeHtml(first.institution_name)}</h2><span>${escapeHtml(first.category)}</span><span>seed ${escapeHtml(first.run_seed || "legacy")}</span><a href="${escapeHtml(first.website)}" target="_blank" rel="noreferrer">Open school website</a></header>
+  ${schoolDecision}
   <div class="candidates">${candidates}</div>
 </section>`;
   }).join("\n");
   const html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Logo review</title><style>
-body{margin:0;background:#f4f6f8;color:#1d2733;font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}.page{max-width:1440px;margin:auto;padding:28px}h1{margin:0 0 6px}p{color:#526170}.school{background:#fff;border:1px solid #dce3ea;border-radius:12px;padding:18px;margin:16px 0;box-shadow:0 1px 2px #1018280d}.school header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}.school h2{font-size:18px;margin:0}.school header span{color:#596779}.school a{color:#0a63bd}.candidates{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:14px}.candidate{border:1px solid #e1e7ed;border-radius:8px;padding:12px;min-width:0}.candidate img,.missing-image{display:block;width:100%;height:180px;object-fit:contain;background:#f8fafc;border-radius:5px}.missing-image{display:grid;place-items:center;color:#7a8794}.candidate-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:9px}.candidate-meta a{margin-left:auto}.selected{background:#d9f5e5;color:#0d6b35;border-radius:999px;padding:2px 8px;font-size:12px}.error{color:#a22626;margin:9px 0 0}.footer{margin-top:20px;color:#637281;font-size:12px}</style></head>
+body{margin:0;background:#f4f6f8;color:#1d2733;font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}.page{max-width:1440px;margin:auto;padding:28px}h1{margin:0 0 6px}p{color:#526170}.school{background:#fff;border:1px solid #dce3ea;border-radius:12px;padding:18px;margin:16px 0;box-shadow:0 1px 2px #1018280d}.school header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}.school h2{font-size:18px;margin:0}.school header span{color:#596779}.school a{color:#0a63bd}.school-decision{margin:10px 0 0;color:#374151}.candidates{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:14px}.candidate{border:1px solid #e1e7ed;border-radius:8px;padding:12px;min-width:0}.candidate img,.missing-image{display:block;width:100%;height:180px;object-fit:contain;background:#f8fafc;border-radius:5px}.missing-image{display:grid;place-items:center;color:#7a8794}.candidate-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:9px}.candidate-meta a{margin-left:auto}.selected{background:#d9f5e5;color:#0d6b35;border-radius:999px;padding:2px 8px;font-size:12px}.ai-decision{background:#e8efff;color:#244a9d;border-radius:999px;padding:2px 8px;font-size:12px}.error{color:#a22626;margin:9px 0 0}.footer{margin-top:20px;color:#637281;font-size:12px}</style></head>
 <body><main class="page"><h1>Logo review</h1><p>${rows.length} evaluation row${rows.length === 1 ? "" : "s"}. Images are loaded locally from the <code>previews</code> folder.</p>${cards}<p class="footer">Generated by scripts/logos/scrape-website-logos.ts</p></main></body></html>`;
   await writeFile(REVIEW_HTML, html, "utf8");
   try {
@@ -947,6 +1221,15 @@ async function main(): Promise<void> {
     console.log(`Visual review: ${REVIEW_HTML}`);
     return;
   }
+  const selector = options.aiEnabled
+    ? new OllamaLogoSelector({ baseUrl: options.ollamaUrl, model: options.aiModel, keepAlive: options.aiKeepAlive })
+    : null;
+  if (selector) {
+    await selector.assertAvailable();
+    console.log(`AI selector: ${options.aiModel} at ${options.ollamaUrl} (threshold ${options.aiThreshold}, concurrency ${options.aiConcurrency})`);
+  } else {
+    console.log("AI selector: disabled; deterministic rank-1 selection remains enabled.");
+  }
   const institutions = await selectInstitutions(options, processedIds(existingRows, options.refreshFailed));
   if (institutions.length === 0) {
     console.log("No eligible schools remain for evaluation.");
@@ -954,28 +1237,36 @@ async function main(): Promise<void> {
   }
 
   console.log("Website logo evaluation");
+  console.log(`Seed: ${options.seed}`);
   console.log(`Schools selected: ${institutions.length}`);
   console.log(`Manifest: ${MANIFEST_CSV}`);
   console.log(`Review CSV: ${REVIEW_CSV}`);
   console.log(`Visual review: ${REVIEW_HTML}`);
   console.log(`Preview directory: ${PREVIEW_DIR}`);
+  if (options.apply) console.log("Apply mode: accepted AI selections will be uploaded to remote R2 and recorded in remote D1.");
   const limiter = new HostLimiter(options.perHostDelayMs);
+  const aiQueue = selector ? new WorkQueue(options.aiConcurrency) : null;
   let completed = 0;
   const batches = await mapLimit(institutions, options.concurrency, async (institution) => {
-    const rows = await evaluateInstitution(institution, options, limiter);
+    const rows = await evaluateInstitution(institution, options, limiter, selector, aiQueue);
     completed += 1;
     console.log(`Evaluated ${completed}/${institutions.length}: ${institution.name}`);
     return rows;
   });
   const rows = batches.flat();
   await appendManifestRows(rows);
-  await writeReviewArtifacts([...existingRows, ...rows]);
+  if (!options.apply) await writeReviewArtifacts([...existingRows, ...rows]);
 
   const statusCounts = new Map<string, number>();
   for (const row of rows) statusCounts.set(row.status, (statusCounts.get(row.status) ?? 0) + 1);
   console.log("Summary");
   for (const [status, count] of [...statusCounts.entries()].sort(([left], [right]) => left.localeCompare(right))) console.log(`  ${status}: ${count}`);
-  console.log("No D1 or R2 changes were made.");
+  if (options.apply) {
+    const result = await applyAcceptedSelections(rows);
+    console.log(`Remote changes: ${result.uploaded} logo${result.uploaded === 1 ? "" : "s"} uploaded and recorded; ${result.skipped} evaluation row${result.skipped === 1 ? "" : "s"} not applied.`);
+  } else {
+    console.log("No D1 or R2 changes were made.");
+  }
 }
 
 main().catch((error: unknown) => {
