@@ -4,6 +4,8 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { parse } from "csv-parse/sync";
+import * as cheerio from "cheerio";
+import type { Element } from "domhandler";
 import sharp, { type Metadata } from "sharp";
 import { OllamaLogoSelector, type LogoCandidateKind, type LogoSelection, type LogoSelector } from "./logo-selector.js";
 
@@ -16,6 +18,8 @@ const OUTPUT_DIR = path.join(REPOSITORY_ROOT, "data", "logos");
 const REVIEW_CSV = path.join(OUTPUT_DIR, "logo-review.csv");
 const MANIFEST_CSV = path.join(OUTPUT_DIR, "logo-manifest.csv");
 const REVIEW_HTML = path.join(OUTPUT_DIR, "logo-review.html");
+const RETRIEVAL_CSV = path.join(OUTPUT_DIR, "logo-retrieval-review.csv");
+const RETRIEVAL_HTML = path.join(OUTPUT_DIR, "logo-retrieval-review.html");
 const PREVIEW_DIR = path.join(OUTPUT_DIR, "previews");
 
 const DEFAULT_LIMIT = 20;
@@ -30,7 +34,9 @@ const DEFAULT_AI_THRESHOLD = 0.8;
 const DEFAULT_AI_CONCURRENCY = 1;
 const DEFAULT_AI_KEEP_ALIVE = "30m";
 const DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434";
-const MAX_DISCOVERY_CANDIDATES = 24;
+const MAX_DISCOVERY_CANDIDATES = 144;
+const TEXT_RANK_BATCH_SIZE = 36;
+const TEXT_RANK_RESULT_SIZE = 12;
 const MAX_HTML_BYTES = 2 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 512 * 1024;
@@ -78,6 +84,8 @@ type Candidate = {
   inlineSvg: string | null;
   source: string;
   metadata: string;
+  ancestry: string;
+  pageRegion: string;
   qualification: "strong" | "fallback";
   initialScore: number;
   reasons: string[];
@@ -106,6 +114,8 @@ type ReviewRow = {
   height: string;
   reasons: string;
   candidate_metadata: string;
+  candidate_ancestry: string;
+  candidate_region: string;
   ai_choice: string;
   ai_confidence: string;
   ai_reason: string;
@@ -130,17 +140,47 @@ type CandidateResult = {
   finalUrl: string;
 };
 
+type RetrievalReviewRow = {
+  institution_id: string;
+  run_seed: string;
+  institution_name: string;
+  category: string;
+  website: string;
+  inventory_index: string;
+  batch_number: string;
+  source: string;
+  candidate_url: string;
+  source_page_url: string;
+  page_region: string;
+  metadata: string;
+  ancestry: string;
+  batch_rank: string;
+  final_rank: string;
+  status: string;
+  error: string;
+};
+
+type EvaluationResult = {
+  reviewRows: ReviewRow[];
+  retrievalRows: RetrievalReviewRow[];
+};
+
 const ACCEPTABLE_AI_KINDS = new Set<LogoCandidateKind>(["logo", "wordmark", "seal", "crest"]);
 
 const MANIFEST_HEADER = [
   "institution_id", "run_seed", "institution_name", "normalized_name", "category", "city", "state", "website",
   "source_page_url", "candidate_url", "preview_path", "candidate_rank", "score", "auto_selected",
-  "status", "content_type", "source_bytes", "preview_bytes", "width", "height", "reasons", "candidate_metadata",
+  "status", "content_type", "source_bytes", "preview_bytes", "width", "height", "reasons", "candidate_metadata", "candidate_ancestry", "candidate_region",
   "ai_choice", "ai_confidence", "ai_reason", "ai_model", "ai_status", "ai_duration_ms", "ai_kind", "ai_eligible", "error",
 ] as const;
 
 const REVIEW_HEADER = [
   "institution_name", "category", "website", "candidate_rank", "score", "auto_selected", "ai_kind", "ai_eligible", "ai_choice", "ai_confidence", "ai_status", "candidate_url", "error",
+] as const;
+
+const RETRIEVAL_HEADER = [
+  "institution_id", "run_seed", "institution_name", "category", "website", "inventory_index", "batch_number",
+  "source", "candidate_url", "source_page_url", "page_region", "metadata", "ancestry", "batch_rank", "final_rank", "status", "error",
 ] as const;
 
 const POSITIVE_TOKENS: Array<[string, number]> = [
@@ -362,6 +402,29 @@ function normalizeUrl(value: string, base?: string): string | null {
   }
 }
 
+function assetIdentity(url: string): string {
+  try {
+    const parsed = new URL(url);
+    // CDNs such as Finalsite put resize/quality transforms before a stable
+    // versioned asset path. Treat each transformed rendition as one source
+    // image so it cannot consume multiple text-ranking or preview slots.
+    const versionedAsset = parsed.pathname.match(/\/v\d+\/(.+)$/i)?.[1];
+    return `${parsed.origin.toLowerCase()}/${versionedAsset ?? parsed.pathname.replace(/^\//, "")}`;
+  } catch {
+    return url;
+  }
+}
+
+function isVideoAsset(url: string, context: string): boolean {
+  try {
+    const pathname = new URL(url).pathname.toLowerCase();
+    if (/\.(?:mp4|webm|mov|m4v|avi|mkv|ogv|m3u8)$/i.test(pathname)) return true;
+  } catch {
+    // The URL is normalized before this check, so this is defensive only.
+  }
+  return /\b(?:video|audio)\/(?:mp4|webm|mpeg|ogg|quicktime)\b/i.test(context);
+}
+
 function hostWithoutWww(url: string): string {
   return new URL(url).hostname.toLowerCase().replace(/^www\./, "");
 }
@@ -404,6 +467,34 @@ function tokenScore(value: string): { score: number; reasons: string[] } {
 
 function parseSrcset(value: string): string[] {
   return value.split(",").map((entry) => entry.trim().split(/\s+/)[0]).filter(Boolean);
+}
+
+function jsonAssetUrls(value: string): string[] {
+  const variants = [value.replaceAll("&quot;", '"')];
+  try {
+    variants.push(decodeURIComponent(value).replaceAll("&quot;", '"'));
+  } catch {
+    // An ordinary URL can contain a malformed percent escape; keep treating it as a URL.
+  }
+  for (const variant of variants) {
+    try {
+      const parsed: unknown = JSON.parse(variant);
+      const urls: string[] = [];
+      const collect = (item: unknown): void => {
+        if (Array.isArray(item)) return void item.forEach(collect);
+        if (!item || typeof item !== "object") return;
+        for (const [key, nested] of Object.entries(item)) {
+          if (typeof nested === "string" && ["url", "src", "href"].includes(key.toLowerCase())) urls.push(nested);
+          else collect(nested);
+        }
+      };
+      collect(parsed);
+      if (urls.length > 0) return [...new Set(urls)];
+    } catch {
+      // Not a JSON asset descriptor.
+    }
+  }
+  return [];
 }
 
 function hasPositiveLogoSignal(value: string): boolean {
@@ -457,15 +548,79 @@ function structuralScore(value: string): { score: number; reasons: string[] } {
   const text = value.toLowerCase();
   const reasons: string[] = [];
   let score = 0;
-  if (/<header\b|headerlogo|header-logo|logoimage|logo-image/.test(text)) {
+  if (/<header\b|\bheader\b|headerlogo|header-logo|logoimage|logo-image/.test(text)) {
     score += 28;
     reasons.push("structure:header");
   }
-  if (/\bid\s*=\s*["'][^"']*logo|\bclass\s*=\s*["'][^"']*logo|\balt\s*=\s*["'][^"']*logo/.test(text)) {
+  if (/\bid\s*=\s*["'][^"']*logo|\bclass\s*=\s*["'][^"']*logo|\balt\s*=\s*["'][^"']*logo|(?:school|site|brand)[-_ ]?logo|logo[-_ ]?(?:image|container|wrapper|link)/.test(text)) {
     score += 26;
     reasons.push("structure:logo-container");
   }
   return { score, reasons };
+}
+
+function semanticAncestry($: cheerio.CheerioAPI, element: Element): { ancestry: string; pageRegion: string } {
+  const parts: string[] = [];
+  let pageRegion = "document";
+  let current: Element | null = element;
+  while (current) {
+    const tagName = current.tagName?.toLowerCase();
+    if (tagName) {
+      const attributes: Record<string, string> = current.attribs ?? {};
+      const details: string[] = [];
+      for (const name of ["id", "class", "role", "aria-label", "aria-labelledby", "title"]) {
+        const value = attributes[name];
+        if (value) details.push(`${name}=${value.replace(/\s+/g, " ").slice(0, 160)}`);
+      }
+      for (const [name, value] of Object.entries(attributes)) {
+        if (!name.startsWith("data-") || !value || !/(logo|brand|identity|image|school|header)/i.test(`${name} ${value}`)) continue;
+        details.push(`${name}=${value.replace(/\s+/g, " ").slice(0, 160)}`);
+      }
+      const meaningful = tagName === "header" || tagName === "nav" || tagName === "main" || tagName === "footer" || tagName === "a" || details.length > 0;
+      if (meaningful) parts.push(`${tagName}${details.length ? `(${[...new Set(details)].join("; ")})` : ""}`);
+      if (tagName === "header") pageRegion = "header";
+      else if (pageRegion === "document" && ["nav", "main", "footer"].includes(tagName)) pageRegion = tagName;
+    }
+    current = current.parent as Element | null;
+  }
+  return { ancestry: parts.join(" > "), pageRegion };
+}
+
+function elementMetadata(element: Element): string {
+  const attributes: Record<string, string> = element.attribs ?? {};
+  const details = [`tag=${element.tagName ?? "unknown"}`];
+  for (const [name, value] of Object.entries(attributes)) {
+    if (!value) continue;
+    if (["alt", "class", "id", "title", "role", "aria-label", "type"].includes(name) || name.startsWith("data-")) {
+      details.push(`${name}=${value.replace(/\s+/g, " ").slice(0, 240)}`);
+    }
+  }
+  return details.join("; ");
+}
+
+function elementAssetUrls(element: Element): string[] {
+  const attributes: Record<string, string> = element.attribs ?? {};
+  const urls: string[] = [];
+  for (const [name, value] of Object.entries(attributes)) {
+    if (!value) continue;
+    const lowerName = name.toLowerCase();
+    if (lowerName === "srcset" || lowerName.endsWith("-srcset")) {
+      urls.push(...parseSrcset(value));
+    } else if (lowerName === "src" || lowerName === "href" || /^(?:data-(?:src|image|lazy|original|url)(?:-|$))/.test(lowerName)) {
+      const extracted = jsonAssetUrls(value);
+      urls.push(...(extracted.length > 0 ? extracted : [value.trim()]));
+    }
+  }
+  return [...new Set(urls)];
+}
+
+function isFaviconCandidate(candidate: Candidate): boolean {
+  return candidate.source === "document-icon" || candidate.source === "web-manifest" || candidate.source === "favicon-fallback";
+}
+
+function isAcceptableAiAssessment(candidate: CandidateResult, assessment: { kind: LogoCandidateKind; eligible: boolean } | null | undefined, faviconFallback: boolean): boolean {
+  if (!assessment?.eligible) return false;
+  return ACCEPTABLE_AI_KINDS.has(assessment.kind) || (faviconFallback && isFaviconCandidate(candidate.candidate) && assessment.kind === "icon");
 }
 
 function addCandidate(candidates: Map<string, Candidate>, candidate: Candidate): void {
@@ -482,31 +637,35 @@ function addImageCandidate(
   baseScore: number,
   signalText: string,
   structuralContext = "",
+  ancestry = "",
+  pageRegion = "",
 ): void {
   if (!rawUrl) return;
   const url = normalizeUrl(rawUrl, pageUrl);
   if (!url) return;
-  const assetText = assetSignalText(url, signalText);
+  if (isVideoAsset(url, signalText)) return;
+  const assetText = assetSignalText(url, `${signalText} ${ancestry}`);
   if (rejectedAsset(assetText)) return;
-  if (likelyNonLogoAsset(assetText)) return;
   const urlSignals = tokenScore(url);
-  const contextSignals = tokenScore(signalText);
+  const contextSignals = tokenScore(`${signalText} ${ancestry}`);
   const institutionSignals = institutionMatchScore(institution, assetText);
   const structureSignals = structuralScore(structuralContext);
   const genericImageSource = source === "image-element" || source === "picture-source" || source === "css-background";
-  const explicitSignal = hasDirectLogoSignal(url, signalText);
+  const explicitSignal = hasDirectLogoSignal(url, `${signalText} ${ancestry}`);
   const fallbackSource = source === "document-icon" || source === "web-manifest" || source === "favicon-fallback";
-  if (genericImageSource && !explicitSignal) return;
+  if (source === "css-background" && !explicitSignal) return;
   if (!genericImageSource && !fallbackSource && !explicitSignal) return;
   const contextScore = genericImageSource ? Math.trunc(contextSignals.score * 0.35) : contextSignals.score;
   addCandidate(candidates, {
     institution,
     sourcePageUrl: pageUrl,
-    key: url,
+    key: assetIdentity(url),
     url,
     inlineSvg: null,
     source,
     metadata: signalText.replace(/\s+/g, " ").trim().slice(0, 500),
+    ancestry,
+    pageRegion,
     qualification: explicitSignal ? "strong" : "fallback",
     initialScore: baseScore + urlSignals.score + contextScore + institutionSignals.score + structureSignals.score,
     reasons: [
@@ -519,14 +678,14 @@ function addImageCandidate(
   });
 }
 
-function addInlineSvgCandidate(candidates: Map<string, Candidate>, institution: Institution, pageUrl: string, svg: string, context: string): void {
+function addInlineSvgCandidate(candidates: Map<string, Candidate>, institution: Institution, pageUrl: string, svg: string, context: string, ancestry: string, pageRegion: string): void {
   const svgTitle = svg.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1]?.replace(/<[^>]*>/g, " ") ?? "";
-  if (!inlineSvgHasDirectLogoContext(context)) return;
-  const signals = `${svgTitle} ${context.slice(-500)}`;
+  if (!inlineSvgHasDirectLogoContext(`${context} ${ancestry}`)) return;
+  const signals = `${svgTitle} ${context.slice(-500)} ${ancestry}`;
   if (rejectedAsset(signals)) return;
   const tokenSignals = tokenScore(signals);
   const institutionSignals = institutionMatchScore(institution, signals);
-  const structureSignals = structuralScore(context);
+  const structureSignals = structuralScore(`${context} ${ancestry}`);
   if (!hasPositiveLogoSignal(signals) && institutionSignals.score === 0) return;
   const key = `inline-svg:${createHash("sha256").update(pageUrl).update(svg).digest("hex")}`;
   addCandidate(candidates, {
@@ -537,6 +696,8 @@ function addInlineSvgCandidate(candidates: Map<string, Candidate>, institution: 
     inlineSvg: svg,
     source: "inline-svg",
     metadata: signals.replace(/\s+/g, " ").trim().slice(0, 500),
+    ancestry,
+    pageRegion,
     qualification: "strong",
     initialScore: 65 + tokenSignals.score + institutionSignals.score + structureSignals.score,
     reasons: ["source:inline-svg", ...tokenSignals.reasons, ...institutionSignals.reasons, ...structureSignals.reasons],
@@ -560,48 +721,49 @@ function relevantLinks(html: string, pageUrl: string, rootUrl: string): string[]
 function discoverHtmlCandidates(institution: Institution, html: string, pageUrl: string): { candidates: Candidate[]; manifestUrls: string[] } {
   const candidates = new Map<string, Candidate>();
   const manifestUrls: string[] = [];
-  const tagPattern = /<(link|img|source|meta)\b[^>]*>/gi;
-  for (const match of html.matchAll(tagPattern)) {
-    const tagName = match[1].toLowerCase();
-    const attributes = parseAttributes(match[0]);
-    if (tagName === "link") {
-      const rel = attributes.get("rel")?.toLowerCase() ?? "";
-      const href = attributes.get("href");
-      if (rel.includes("manifest")) {
-        const manifestUrl = href ? normalizeUrl(href, pageUrl) : null;
-        if (manifestUrl) manifestUrls.push(manifestUrl);
-      }
-      if (rel.includes("icon") || rel.includes("image_src")) {
-        addImageCandidate(candidates, institution, pageUrl, href, "document-icon", rel.includes("icon") ? 32 : 22, `${rel} ${attributes.get("sizes") ?? ""}`);
-      }
-      continue;
+  const $ = cheerio.load(html);
+  $("link").each((_, element) => {
+    const attributes = element.attribs ?? {};
+    const rel = attributes.rel?.toLowerCase() ?? "";
+    const href = attributes.href;
+    if (rel.includes("manifest")) {
+      const manifestUrl = href ? normalizeUrl(href, pageUrl) : null;
+      if (manifestUrl) manifestUrls.push(manifestUrl);
     }
-    if (tagName === "meta") {
-      const marker = `${attributes.get("property") ?? ""} ${attributes.get("name") ?? ""}`.toLowerCase();
-      if (marker.includes("og:image") || marker.includes("twitter:image") || marker === "image") {
-        addImageCandidate(candidates, institution, pageUrl, attributes.get("content"), "metadata-image", 5, marker);
-      }
-      continue;
+    if (rel.includes("icon") || rel.includes("image_src")) {
+      addImageCandidate(candidates, institution, pageUrl, href, rel.includes("icon") ? "document-icon" : "metadata-image", 0, elementMetadata(element), "head", "head", "head");
     }
-    const source = tagName === "source" ? "picture-source" : "image-element";
-    const signals = `${attributes.get("alt") ?? ""} ${attributes.get("class") ?? ""} ${attributes.get("id") ?? ""} ${attributes.get("title") ?? ""}`;
-    const index = match.index ?? 0;
-    const structuralContext = html.slice(Math.max(0, index - 1_500), Math.min(html.length, index + match[0].length + 300));
-    const baseScore = 5;
-    addImageCandidate(candidates, institution, pageUrl, attributes.get("src"), source, baseScore, signals, structuralContext);
-    addImageCandidate(candidates, institution, pageUrl, attributes.get("data-src"), source, baseScore, signals, structuralContext);
-    for (const url of parseSrcset(attributes.get("srcset") ?? "")) addImageCandidate(candidates, institution, pageUrl, url, source, baseScore, signals, structuralContext);
-    for (const url of parseSrcset(attributes.get("data-srcset") ?? "")) addImageCandidate(candidates, institution, pageUrl, url, source, baseScore, signals, structuralContext);
-  }
+  });
+  $("meta").each((_, element) => {
+    const attributes = element.attribs ?? {};
+    const marker = `${attributes.property ?? ""} ${attributes.name ?? ""}`.toLowerCase();
+    if (marker.includes("og:image") || marker.includes("twitter:image") || marker === "image") {
+      addImageCandidate(candidates, institution, pageUrl, attributes.content, "metadata-image", 0, elementMetadata(element), "head", "head", "head");
+    }
+  });
+  $("img, source").each((_, element) => {
+    if (element.parent?.type === "tag" && element.parent.tagName?.toLowerCase() === "video") return;
+    const source = element.tagName?.toLowerCase() === "source" ? "picture-source" : "image-element";
+    const metadata = elementMetadata(element);
+    const context = semanticAncestry($, element);
+    for (const assetUrl of elementAssetUrls(element)) {
+      addImageCandidate(candidates, institution, pageUrl, assetUrl, source, 0, metadata, context.ancestry, context.ancestry, context.pageRegion);
+    }
+  });
+  $("[style]").each((_, element) => {
+    const style = element.attribs?.style ?? "";
+    const context = semanticAncestry($, element);
+    for (const match of style.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/gi)) {
+      addImageCandidate(candidates, institution, pageUrl, match[1], "css-background", 0, elementMetadata(element), context.ancestry, context.ancestry, context.pageRegion);
+    }
+  });
   for (const match of html.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/gi)) {
-    addImageCandidate(candidates, institution, pageUrl, match[1], "css-background", 0, match[1]);
+    addImageCandidate(candidates, institution, pageUrl, match[1], "css-background", 0, match[1], "stylesheet", "stylesheet", "stylesheet");
   }
-  const svgPattern = /<svg\b[^>]*>[\s\S]*?<\/svg\s*>/gi;
-  for (const match of html.matchAll(svgPattern)) {
-    const index = match.index ?? 0;
-    const context = html.slice(Math.max(0, index - 1_500), Math.min(html.length, index + match[0].length + 300));
-    addInlineSvgCandidate(candidates, institution, pageUrl, match[0], context);
-  }
+  $("svg").each((_, element) => {
+    const context = semanticAncestry($, element);
+    addInlineSvgCandidate(candidates, institution, pageUrl, $.html(element), elementMetadata(element), context.ancestry, context.pageRegion);
+  });
   addImageCandidate(candidates, institution, pageUrl, "/favicon.ico", "favicon-fallback", 10, "favicon");
   return { candidates: [...candidates.values()], manifestUrls: [...new Set(manifestUrls)] };
 }
@@ -742,6 +904,7 @@ async function fetchImage(url: string, options: Options, limiter: HostLimiter): 
   const response = await fetchWithRetry(url, options, limiter);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const contentType = response.headers.get("content-type")?.toLowerCase() ?? "application/octet-stream";
+  if (contentType.startsWith("video/") || contentType.startsWith("audio/")) throw new Error(`Unsupported media type: ${contentType}`);
   const bytes = await readResponse(response, MAX_IMAGE_BYTES);
   return { bytes, contentType, finalUrl: response.url };
 }
@@ -769,6 +932,15 @@ async function makeWebp(bytes: Buffer): Promise<{ bytes: Buffer; width: number; 
   throw new Error(`Could not compress below ${MAX_WEBP_BYTES} bytes.`);
 }
 
+async function makeVisionPreview(bytes: Buffer): Promise<Buffer> {
+  // Preserve alpha in the stored/review WebP, but give the VLM an opaque dark
+  // canvas so white-on-transparent institutional marks remain legible.
+  return sharp(bytes, { animated: false, limitInputPixels: 40_000_000 })
+    .flatten({ background: "#263548" })
+    .webp({ quality: 82, effort: 4, smartSubsample: true })
+    .toBuffer();
+}
+
 function scoreCandidate(candidate: Candidate, width: number, height: number): { score: number; reasons: string[] } {
   let score = 30 + candidate.initialScore;
   const reasons = [...candidate.reasons];
@@ -787,8 +959,20 @@ function scoreCandidate(candidate: Candidate, width: number, height: number): { 
   return { score: Math.max(0, Math.min(100, score)), reasons };
 }
 
+function reviewScore(score: number, assessment: { kind: LogoCandidateKind; eligible: boolean } | undefined): number {
+  if (!assessment) return score;
+  if (["photo", "document", "screenshot"].includes(assessment.kind)) return Math.min(score, 5);
+  if (!assessment.eligible && assessment.kind === "icon") return Math.min(score, 12);
+  if (!assessment.eligible && assessment.kind === "unknown") return Math.min(score, 20);
+  return score;
+}
+
 function previewFileName(institutionId: string, rank: number): string {
   return `${institutionId.replace(/[^a-z0-9_-]/gi, "_")}-candidate-${rank}.webp`;
+}
+
+function visionPreviewFileName(institutionId: string, rank: number): string {
+  return `${institutionId.replace(/[^a-z0-9_-]/gi, "_")}-candidate-${rank}-vision.webp`;
 }
 
 function reviewRow(institution: Institution, overrides: Partial<ReviewRow>): ReviewRow {
@@ -815,6 +999,8 @@ function reviewRow(institution: Institution, overrides: Partial<ReviewRow>): Rev
     height: "",
     reasons: "",
     candidate_metadata: "",
+    candidate_ancestry: "",
+    candidate_region: "",
     ai_choice: "",
     ai_confidence: "",
     ai_reason: "",
@@ -828,15 +1014,107 @@ function reviewRow(institution: Institution, overrides: Partial<ReviewRow>): Rev
   };
 }
 
+function retrievalRow(institution: Institution, seed: string, candidate: Candidate, inventoryIndex: number, overrides: Partial<RetrievalReviewRow> = {}): RetrievalReviewRow {
+  return {
+    institution_id: institution.id,
+    run_seed: seed,
+    institution_name: institution.name,
+    category: institution.category,
+    website: institution.website,
+    inventory_index: String(inventoryIndex),
+    batch_number: "",
+    source: candidate.source,
+    candidate_url: candidate.url ?? "",
+    source_page_url: candidate.sourcePageUrl,
+    page_region: candidate.pageRegion,
+    metadata: candidate.metadata,
+    ancestry: candidate.ancestry,
+    batch_rank: "",
+    final_rank: "",
+    status: "not_ranked",
+    error: "",
+    ...overrides,
+  };
+}
+
+async function rankCandidateInventory(
+  institution: Institution,
+  seed: string,
+  candidates: Candidate[],
+  selector: LogoSelector,
+  aiQueue: WorkQueue,
+): Promise<{ candidates: Candidate[]; retrievalRows: RetrievalReviewRow[] }> {
+  const indexed = candidates.map((candidate, index) => ({ candidate, index: index + 1 }));
+  const rankable = indexed.filter(({ candidate }) => !isFaviconCandidate(candidate));
+  const shortlisted: Array<{ candidate: Candidate; index: number }> = [];
+  const retrievalRows = new Map<number, RetrievalReviewRow>(indexed.map(({ candidate, index }) => [index, retrievalRow(institution, seed, candidate, index, {
+    batch_number: String(Math.floor((index - 1) / TEXT_RANK_BATCH_SIZE) + 1),
+    status: isFaviconCandidate(candidate) ? "deferred_favicon" : "not_selected_by_text",
+  })]));
+  for (let offset = 0; offset < rankable.length; offset += TEXT_RANK_BATCH_SIZE) {
+    const batch = rankable.slice(offset, offset + TEXT_RANK_BATCH_SIZE);
+    const batchNumber = Math.floor(offset / TEXT_RANK_BATCH_SIZE) + 1;
+    const ranking = await aiQueue.run(() => selector.rankCandidates({
+      institution,
+      // Each model call uses its own 1..N indexes. Small local models often
+      // answer relative to the visible batch even when given global indexes.
+      candidates: batch.map(({ candidate }, localIndex) => ({
+        index: localIndex + 1,
+        source: candidate.source,
+        sourcePageUrl: candidate.sourcePageUrl,
+        candidateUrl: candidate.url ?? "",
+        metadata: candidate.metadata,
+        ancestry: candidate.ancestry,
+        pageRegion: candidate.pageRegion,
+      })),
+    }));
+    for (const [rank, localIndex] of ranking.candidateIndexes.entries()) {
+      const entry = batch[localIndex - 1];
+      if (entry && !shortlisted.some((item) => item.index === entry.index)) {
+        shortlisted.push(entry);
+        const row = retrievalRows.get(entry.index);
+        if (row) retrievalRows.set(entry.index, { ...row, batch_number: String(batchNumber), batch_rank: String(rank + 1), status: "shortlisted_by_text" });
+      }
+    }
+  }
+  if (shortlisted.length === 0) return { candidates: [], retrievalRows: [...retrievalRows.values()] };
+  if (shortlisted.length <= TEXT_RANK_RESULT_SIZE) {
+    for (const [rank, entry] of shortlisted.entries()) {
+      const row = retrievalRows.get(entry.index);
+      if (row) retrievalRows.set(entry.index, { ...row, final_rank: String(rank + 1), status: "selected_for_visual" });
+    }
+    return { candidates: shortlisted.map((entry) => entry.candidate), retrievalRows: [...retrievalRows.values()] };
+  }
+  const finalRanking = await aiQueue.run(() => selector.rankCandidates({
+    institution,
+    candidates: shortlisted.map(({ candidate }, localIndex) => ({
+      index: localIndex + 1,
+      source: candidate.source,
+      sourcePageUrl: candidate.sourcePageUrl,
+      candidateUrl: candidate.url ?? "",
+      metadata: candidate.metadata,
+      ancestry: candidate.ancestry,
+      pageRegion: candidate.pageRegion,
+    })),
+  }));
+  const rankedCandidates = finalRanking.candidateIndexes.map((localIndex) => shortlisted[localIndex - 1]?.candidate).filter((candidate): candidate is Candidate => candidate !== undefined);
+  for (const [rank, localIndex] of finalRanking.candidateIndexes.entries()) {
+    const entry = shortlisted[localIndex - 1];
+    const row = entry ? retrievalRows.get(entry.index) : undefined;
+    if (entry && row) retrievalRows.set(entry.index, { ...row, final_rank: String(rank + 1), status: "selected_for_visual" });
+  }
+  return { candidates: rankedCandidates, retrievalRows: [...retrievalRows.values()] };
+}
+
 async function evaluateInstitution(
   institution: Institution,
   options: Options,
   limiter: HostLimiter,
   selector: LogoSelector | null,
   aiQueue: WorkQueue | null,
-): Promise<ReviewRow[]> {
+): Promise<EvaluationResult> {
   const website = normalizeUrl(institution.website);
-  if (!website) return [reviewRow(institution, { status: "error", error: "Invalid website URL." })];
+  if (!website) return { reviewRows: [reviewRow(institution, { run_seed: options.seed, status: "error", error: "Invalid website URL." })], retrievalRows: [] };
 
   const candidates = new Map<string, Candidate>();
   const pageQueue = [website];
@@ -853,11 +1131,8 @@ async function evaluateInstitution(
       if (visited.size === 1) rootUrl = page.finalUrl;
       const discovered = discoverHtmlCandidates(institution, page.html, page.finalUrl);
       for (const candidate of discovered.candidates) addCandidate(candidates, candidate);
-      const hasStrongCandidate = [...candidates.values()].some((candidate) => candidate.qualification === "strong");
-      if (!hasStrongCandidate) {
-        for (const link of relevantLinks(page.html, page.finalUrl, rootUrl)) {
-          if (!visited.has(link) && !pageQueue.includes(link) && pageQueue.length + visited.size < options.maxPages) pageQueue.push(link);
-        }
+      for (const link of relevantLinks(page.html, page.finalUrl, rootUrl)) {
+        if (!visited.has(link) && !pageQueue.includes(link) && pageQueue.length + visited.size < options.maxPages) pageQueue.push(link);
       }
       for (const manifestUrl of discovered.manifestUrls.slice(0, 2)) {
         try {
@@ -871,45 +1146,93 @@ async function evaluateInstitution(
     }
   }
 
-  const allCandidates = [...candidates.values()];
-  const strongCandidates = allCandidates.filter((candidate) => candidate.qualification === "strong")
-    .sort((left, right) => right.initialScore - left.initialScore || left.key.localeCompare(right.key));
-  const fallbackCandidates = allCandidates.filter((candidate) => candidate.qualification === "fallback")
-    .sort((left, right) => right.initialScore - left.initialScore || left.key.localeCompare(right.key));
-  const discoveryList = (strongCandidates.length > 0 ? strongCandidates : fallbackCandidates).slice(0, MAX_DISCOVERY_CANDIDATES);
-  if (discoveryList.length === 0) {
-    return [reviewRow(institution, { status: firstError ? "error" : "no_candidates", error: firstError ?? "No image candidates found." })];
-  }
-
-  const converted: CandidateResult[] = [];
-  for (const candidate of discoveryList) {
+  const inventory = [...candidates.values()].slice(0, MAX_DISCOVERY_CANDIDATES);
+  const primaryInventory = inventory.filter((candidate) => !isFaviconCandidate(candidate));
+  const faviconInventory = inventory.filter(isFaviconCandidate);
+  let discoveryList = primaryInventory;
+  let usingFaviconFallback = false;
+  let retrievalRows = inventory.map((candidate, index) => retrievalRow(institution, options.seed, candidate, index + 1, {
+    batch_number: String(Math.floor(index / TEXT_RANK_BATCH_SIZE) + 1),
+    status: isFaviconCandidate(candidate) ? "deferred_favicon" : selector ? "not_selected_by_text" : "ai_disabled",
+  }));
+  const useFaviconFallback = (): void => {
+    usingFaviconFallback = true;
+    discoveryList = [...faviconInventory]
+      .sort((left, right) => right.initialScore - left.initialScore || left.key.localeCompare(right.key))
+      .slice(0, options.maxCandidates);
+    const rankByKey = new Map(discoveryList.map((candidate, index) => [candidate.key, index + 1]));
+    retrievalRows = retrievalRows.map((row) => {
+      const rank = rankByKey.get(inventory[Number(row.inventory_index) - 1]?.key);
+      return rank ? { ...row, final_rank: String(rank), status: "selected_as_favicon_fallback" } : row;
+    });
+  };
+  if (selector && aiQueue) {
     try {
-      const image = candidate.inlineSvg
-        ? { bytes: Buffer.from(candidate.inlineSvg, "utf8"), contentType: "image/svg+xml", finalUrl: candidate.sourcePageUrl }
-        : await fetchImage(candidate.url as string, options, limiter);
-      const preview = await makeWebp(image.bytes);
-      const scored = scoreCandidate(candidate, preview.width, preview.height);
-      converted.push({
-        candidate,
-        contentType: image.contentType,
-        sourceBytes: image.bytes.length,
-        preview: preview.bytes,
-        previewBytes: preview.bytes.length,
-        width: preview.width,
-        height: preview.height,
-        score: scored.score,
-        reasons: scored.reasons,
-        finalUrl: image.finalUrl,
-      });
-    } catch {
-      // An inaccessible, oversized, or invalid image is not useful for review.
+      const ranked = await rankCandidateInventory(institution, options.seed, inventory, selector, aiQueue);
+      discoveryList = ranked.candidates;
+      retrievalRows = ranked.retrievalRows;
+      if (discoveryList.length === 0 && faviconInventory.length > 0) useFaviconFallback();
+    } catch (error) {
+      const message = `Text candidate ranking failed: ${cleanError(error)}`;
+      return {
+        reviewRows: [reviewRow(institution, { run_seed: options.seed, status: "error", error: message })],
+        retrievalRows: retrievalRows.map((row) => ({ ...row, status: "text_ranking_error", error: message })),
+      };
+    }
+  } else {
+    discoveryList = [...primaryInventory].sort((left, right) => right.initialScore - left.initialScore || left.key.localeCompare(right.key)).slice(0, TEXT_RANK_RESULT_SIZE);
+    if (discoveryList.length === 0 && faviconInventory.length > 0) useFaviconFallback();
+    else {
+      const rankByKey = new Map(discoveryList.map((candidate, index) => [candidate.key, index + 1]));
+      retrievalRows = retrievalRows.map((row) => ({ ...row, final_rank: rankByKey.get(inventory[Number(row.inventory_index) - 1]?.key) ? String(rankByKey.get(inventory[Number(row.inventory_index) - 1]?.key)) : "" }));
     }
   }
-  if (converted.length === 0) {
-    return [reviewRow(institution, { status: "no_candidates", error: "Discovered URLs did not yield downloadable images." })];
+  if (discoveryList.length === 0) {
+    return { reviewRows: [reviewRow(institution, { run_seed: options.seed, status: firstError ? "error" : "no_candidates", error: firstError ?? "No image candidates found." })], retrievalRows };
   }
 
-  converted.sort((left, right) => right.score - left.score || left.finalUrl.localeCompare(right.finalUrl));
+  const convertCandidates = async (items: Candidate[]): Promise<CandidateResult[]> => {
+    const converted: CandidateResult[] = [];
+    for (const candidate of items) {
+      try {
+        const image = candidate.inlineSvg
+          ? { bytes: Buffer.from(candidate.inlineSvg, "utf8"), contentType: "image/svg+xml", finalUrl: candidate.sourcePageUrl }
+          : await fetchImage(candidate.url as string, options, limiter);
+        const preview = await makeWebp(image.bytes);
+        const scored = scoreCandidate(candidate, preview.width, preview.height);
+        converted.push({
+          candidate,
+          contentType: image.contentType,
+          sourceBytes: image.bytes.length,
+          preview: preview.bytes,
+          previewBytes: preview.bytes.length,
+          width: preview.width,
+          height: preview.height,
+          score: scored.score,
+          reasons: scored.reasons,
+          finalUrl: image.finalUrl,
+        });
+      } catch {
+        // An inaccessible, oversized, or invalid image is not useful for review.
+      }
+    }
+    return converted;
+  };
+  let converted = await convertCandidates(discoveryList);
+  if (converted.length === 0 && !usingFaviconFallback && faviconInventory.length > 0) {
+    useFaviconFallback();
+    converted = await convertCandidates(discoveryList);
+  }
+  if (converted.length === 0) {
+    return { reviewRows: [reviewRow(institution, { run_seed: options.seed, status: "no_candidates", error: "Discovered URLs did not yield downloadable images." })], retrievalRows };
+  }
+
+  if (selector) {
+    const retrievalOrder = new Map(discoveryList.map((candidate, index) => [candidate.key, index]));
+    converted.sort((left, right) => (retrievalOrder.get(left.candidate.key) ?? Number.MAX_SAFE_INTEGER) - (retrievalOrder.get(right.candidate.key) ?? Number.MAX_SAFE_INTEGER));
+  } else {
+    converted.sort((left, right) => right.score - left.score || left.finalUrl.localeCompare(right.finalUrl));
+  }
   const uniqueConverted = new Map<string, CandidateResult>();
   for (const candidate of converted) {
     const fingerprint = createHash("sha256").update(candidate.preview).digest("hex");
@@ -917,7 +1240,10 @@ async function evaluateInstitution(
   }
   const selected = [...uniqueConverted.values()].slice(0, options.maxCandidates);
   for (const [index, candidate] of selected.entries()) {
-    await writeFile(path.join(PREVIEW_DIR, previewFileName(institution.id, index + 1)), candidate.preview);
+    await Promise.all([
+      writeFile(path.join(PREVIEW_DIR, previewFileName(institution.id, index + 1)), candidate.preview),
+      makeVisionPreview(candidate.preview).then((preview) => writeFile(path.join(PREVIEW_DIR, visionPreviewFileName(institution.id, index + 1)), preview)),
+    ]);
   }
 
   let selection: LogoSelection | null = null;
@@ -927,9 +1253,10 @@ async function evaluateInstitution(
     try {
       selection = await aiQueue.run(() => selector.select({
         institution,
+        allowFaviconFallback: usingFaviconFallback,
         candidates: selected.map((candidate, index) => ({
           index: index + 1,
-          previewPath: path.join(PREVIEW_DIR, previewFileName(institution.id, index + 1)),
+          previewPath: path.join(PREVIEW_DIR, visionPreviewFileName(institution.id, index + 1)),
           source: candidate.candidate.source,
           sourcePageUrl: candidate.candidate.sourcePageUrl,
           candidateUrl: candidate.finalUrl,
@@ -942,7 +1269,7 @@ async function evaluateInstitution(
         : selectionResult.assessments.find((assessment) => assessment.index === selectionResult.candidateIndex) ?? null;
       aiStatus = selectionResult.candidateIndex === null
         ? "no_match"
-        : !chosenAssessment?.eligible || !ACCEPTABLE_AI_KINDS.has(chosenAssessment.kind)
+        : !isAcceptableAiAssessment(selected[selectionResult.candidateIndex - 1], chosenAssessment, usingFaviconFallback)
           ? "rejected_kind"
           : selectionResult.confidence >= options.aiThreshold ? "accepted" : "below_threshold";
     } catch (error) {
@@ -952,7 +1279,7 @@ async function evaluateInstitution(
   const aiAcceptedRank = selection && selection.candidateIndex !== null && selection.confidence >= options.aiThreshold
     && (() => {
       const assessment = selection.assessments.find((item) => item.index === selection.candidateIndex);
-      return assessment?.eligible === true && ACCEPTABLE_AI_KINDS.has(assessment.kind);
+      return isAcceptableAiAssessment(selected[selection.candidateIndex - 1], assessment, usingFaviconFallback);
     })()
     ? selection.candidateIndex
     : null;
@@ -967,7 +1294,7 @@ async function evaluateInstitution(
       candidate_url: candidate.finalUrl,
       preview_path: path.relative(REPOSITORY_ROOT, filePath).replaceAll(path.sep, "/"),
       candidate_rank: String(rank),
-      score: String(candidate.score),
+      score: String(reviewScore(candidate.score, assessment)),
       auto_selected: String(selector ? rank === aiAcceptedRank : rank === 1 && candidate.score >= options.minScore),
       status: "candidate",
       content_type: candidate.contentType,
@@ -977,6 +1304,8 @@ async function evaluateInstitution(
       height: String(candidate.height),
       reasons: candidate.reasons.join(";"),
       candidate_metadata: candidate.candidate.metadata,
+      candidate_ancestry: candidate.candidate.ancestry,
+      candidate_region: candidate.candidate.pageRegion,
       ai_choice: selection?.candidateIndex === null ? "none" : String(selection?.candidateIndex ?? ""),
       ai_confidence: selection ? selection.confidence.toFixed(2) : "",
       ai_reason: selection?.reason ?? aiError,
@@ -987,7 +1316,7 @@ async function evaluateInstitution(
       ai_eligible: assessment ? String(assessment.eligible) : "",
     }));
   }
-  return rows;
+  return { reviewRows: rows, retrievalRows };
 }
 
 function seededRandom(seed: string): () => number {
@@ -1022,6 +1351,14 @@ async function readManifestRows(): Promise<ReviewRow[]> {
       state: row.state || null,
       website: row.website ?? "",
     }, row));
+  } catch {
+    return [];
+  }
+}
+
+async function readRetrievalRows(): Promise<RetrievalReviewRow[]> {
+  try {
+    return parse(await readFile(RETRIEVAL_CSV, "utf8"), { columns: true, bom: true, skip_empty_lines: true }) as RetrievalReviewRow[];
   } catch {
     return [];
   }
@@ -1070,6 +1407,13 @@ async function ensureOutput(): Promise<void> {
       await writeFile(MANIFEST_CSV, `\uFEFF${MANIFEST_HEADER.join(",")}\r\n`, "utf8");
     }
   }
+  try {
+    const retrieval = await readFile(RETRIEVAL_CSV, "utf8");
+    const header = retrieval.split(/\r?\n/, 1)[0]?.replace(/^\uFEFF/, "").split(",") ?? [];
+    if (!RETRIEVAL_HEADER.every((column) => header.includes(column))) await writeRetrievalRows(await readRetrievalRows());
+  } catch {
+    await writeRetrievalRows([]);
+  }
 }
 
 async function readLegacyReviewRows(): Promise<ReviewRow[]> {
@@ -1099,6 +1443,11 @@ async function appendManifestRows(rows: ReviewRow[]): Promise<void> {
   if (rows.length === 0) return;
   const csv = rows.map((row) => MANIFEST_HEADER.map((header) => csvValue(row[header])).join(",")).join("\r\n");
   await writeFile(MANIFEST_CSV, `${csv}\r\n`, { encoding: "utf8", flag: "a" });
+}
+
+async function writeRetrievalRows(rows: RetrievalReviewRow[]): Promise<void> {
+  const csv = rows.map((row) => RETRIEVAL_HEADER.map((header) => csvValue(row[header])).join(",")).join("\r\n");
+  await writeFile(RETRIEVAL_CSV, `\uFEFF${RETRIEVAL_HEADER.join(",")}\r\n${csv}${csv ? "\r\n" : ""}`, "utf8");
 }
 
 function escapeHtml(value: string): string {
@@ -1171,7 +1520,7 @@ async function writeReviewArtifacts(rows: ReviewRow[]): Promise<void> {
   const html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Logo review</title><style>
-body{margin:0;background:#f4f6f8;color:#1d2733;font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}.page{max-width:1440px;margin:auto;padding:28px}h1{margin:0 0 6px}p{color:#526170}.school{background:#fff;border:1px solid #dce3ea;border-radius:12px;padding:18px;margin:16px 0;box-shadow:0 1px 2px #1018280d}.school header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}.school h2{font-size:18px;margin:0}.school header span{color:#596779}.school a{color:#0a63bd}.school-decision{margin:10px 0 0;color:#374151}.candidates{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:14px}.candidate{border:1px solid #e1e7ed;border-radius:8px;padding:12px;min-width:0}.candidate img,.missing-image{display:block;width:100%;height:180px;object-fit:contain;background:#f8fafc;border-radius:5px}.missing-image{display:grid;place-items:center;color:#7a8794}.candidate-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:9px}.candidate-meta a{margin-left:auto}.selected{background:#d9f5e5;color:#0d6b35;border-radius:999px;padding:2px 8px;font-size:12px}.ai-decision{background:#e8efff;color:#244a9d;border-radius:999px;padding:2px 8px;font-size:12px}.error{color:#a22626;margin:9px 0 0}.footer{margin-top:20px;color:#637281;font-size:12px}</style></head>
+body{margin:0;background:#f4f6f8;color:#1d2733;font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}.page{max-width:1440px;margin:auto;padding:28px}h1{margin:0 0 6px}p{color:#526170}.school{background:#fff;border:1px solid #dce3ea;border-radius:12px;padding:18px;margin:16px 0;box-shadow:0 1px 2px #1018280d}.school header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}.school h2{font-size:18px;margin:0}.school header span{color:#596779}.school a{color:#0a63bd}.school-decision{margin:10px 0 0;color:#374151}.candidates{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:14px}.candidate{border:1px solid #e1e7ed;border-radius:8px;padding:12px;min-width:0}.candidate img,.missing-image{display:block;width:100%;height:180px;object-fit:contain;background-color:#263548;background-image:linear-gradient(45deg,#314257 25%,transparent 25%),linear-gradient(-45deg,#314257 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#314257 75%),linear-gradient(-45deg,transparent 75%,#314257 75%);background-size:20px 20px;background-position:0 0,0 10px,10px -10px,-10px 0;border-radius:5px}.missing-image{display:grid;place-items:center;color:#d5dee8}.candidate-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:9px}.candidate-meta a{margin-left:auto}.selected{background:#d9f5e5;color:#0d6b35;border-radius:999px;padding:2px 8px;font-size:12px}.ai-decision{background:#e8efff;color:#244a9d;border-radius:999px;padding:2px 8px;font-size:12px}.error{color:#a22626;margin:9px 0 0}.footer{margin-top:20px;color:#637281;font-size:12px}</style></head>
 <body><main class="page"><h1>Logo review</h1><p>${rows.length} evaluation row${rows.length === 1 ? "" : "s"}. Images are loaded locally from the <code>previews</code> folder.</p>${cards}<p class="footer">Generated by scripts/logos/scrape-website-logos.ts</p></main></body></html>`;
   await writeFile(REVIEW_HTML, html, "utf8");
   try {
@@ -1183,6 +1532,31 @@ body{margin:0;background:#f4f6f8;color:#1d2733;font:14px/1.45 system-ui,-apple-s
     }
     throw error;
   }
+}
+
+async function writeRetrievalArtifacts(rows: RetrievalReviewRow[]): Promise<void> {
+  await writeRetrievalRows(rows);
+  const byInstitution = new Map<string, RetrievalReviewRow[]>();
+  for (const row of rows) byInstitution.set(row.institution_id, [...(byInstitution.get(row.institution_id) ?? []), row]);
+  const schools = [...byInstitution.values()].map((group) => {
+    const first = group[0];
+    const tableRows = group.map((row) => {
+      const asset = row.candidate_url
+        ? `<a href="${escapeHtml(row.candidate_url)}" target="_blank" rel="noreferrer">Open asset</a>`
+        : "Inline SVG";
+      const source = row.source_page_url
+        ? `<a href="${escapeHtml(row.source_page_url)}" target="_blank" rel="noreferrer">Open page</a>`
+        : "";
+      return `<tr><td>${escapeHtml(row.inventory_index)}</td><td>${escapeHtml(row.batch_number || "—")}</td><td>${escapeHtml(row.batch_rank || "—")}</td><td>${escapeHtml(row.final_rank || "—")}</td><td><span class="status ${escapeHtml(row.status)}">${escapeHtml(row.status)}</span></td><td>${escapeHtml(row.page_region || "—")}</td><td>${escapeHtml(row.source)}</td><td>${asset}</td><td>${source}</td><td><code>${escapeHtml(row.metadata || "—")}</code></td><td><code>${escapeHtml(row.ancestry || "—")}</code></td><td>${escapeHtml(row.error || "")}</td></tr>`;
+    }).join("\n");
+    return `<section class="school"><header><h2>${escapeHtml(first.institution_name)}</h2><span>${escapeHtml(first.category)}</span><span>seed ${escapeHtml(first.run_seed || "legacy")}</span><a href="${escapeHtml(first.website)}" target="_blank" rel="noreferrer">Open school website</a></header><p>${group.length} raw DOM asset${group.length === 1 ? "" : "s"}. <strong>selected_for_visual</strong> rows were handed off by text ranking; <strong>selected_as_favicon_fallback</strong> is used only when no ordinary asset can be evaluated.</p><div class="scroll"><table><thead><tr><th>Inventory</th><th>Batch</th><th>Batch rank</th><th>Final rank</th><th>Text status</th><th>Region</th><th>Discovery source</th><th>Asset</th><th>Page</th><th>Element metadata</th><th>Semantic ancestry</th><th>Error</th></tr></thead><tbody>${tableRows}</tbody></table></div></section>`;
+  }).join("\n");
+  const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Logo text retrieval audit</title><style>
+body{margin:0;background:#f4f6f8;color:#1d2733;font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}.page{max-width:1800px;margin:auto;padding:28px}h1{margin:0 0 6px}p{color:#526170}.school{background:#fff;border:1px solid #dce3ea;border-radius:12px;padding:18px;margin:16px 0;box-shadow:0 1px 2px #1018280d}.school header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}.school h2{font-size:18px;margin:0}.school header span{color:#596779}.school a{color:#0a63bd}.scroll{overflow:auto;border:1px solid #e1e7ed;border-radius:8px}table{width:100%;border-collapse:collapse;min-width:1500px}th,td{padding:9px 10px;border-bottom:1px solid #e7ecf1;text-align:left;vertical-align:top}th{position:sticky;top:0;background:#f8fafc;font-size:12px;white-space:nowrap}tr:last-child td{border-bottom:0}code{display:block;max-width:420px;white-space:normal;overflow-wrap:anywhere;font:12px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;color:#344054}.status{display:inline-block;border-radius:999px;padding:2px 7px;background:#eef2f6;color:#455468;font-size:12px;white-space:nowrap}.status.shortlisted_by_text{background:#e8efff;color:#244a9d}.status.selected_for_visual{background:#d9f5e5;color:#0d6b35}.status.selected_as_favicon_fallback{background:#fff0c2;color:#8a5600}.status.text_ranking_error{background:#fee4e2;color:#b42318}.footer{margin-top:20px;color:#637281;font-size:12px}</style></head>
+<body><main class="page"><h1>Logo text retrieval audit</h1><p>${rows.length} raw DOM candidate${rows.length === 1 ? "" : "s"}. This is the first-stage text-only ranking audit; no image judgment is represented here.</p>${schools}<p class="footer">Generated by scripts/logos/scrape-website-logos.ts</p></main></body></html>`;
+  await writeFile(RETRIEVAL_HTML, html, "utf8");
 }
 
 async function mapLimit<T, R>(items: T[], concurrency: number, callback: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -1215,10 +1589,14 @@ async function main(): Promise<void> {
 
   await ensureOutput();
   const existingRows = await readManifestRows();
+  const existingRetrievalRows = await readRetrievalRows();
   if (options.renderReview) {
     await writeReviewArtifacts(existingRows);
+    await writeRetrievalArtifacts(existingRetrievalRows);
     console.log(`Review CSV: ${REVIEW_CSV}`);
     console.log(`Visual review: ${REVIEW_HTML}`);
+    console.log(`Text retrieval CSV: ${RETRIEVAL_CSV}`);
+    console.log(`Text retrieval audit: ${RETRIEVAL_HTML}`);
     return;
   }
   const selector = options.aiEnabled
@@ -1242,19 +1620,23 @@ async function main(): Promise<void> {
   console.log(`Manifest: ${MANIFEST_CSV}`);
   console.log(`Review CSV: ${REVIEW_CSV}`);
   console.log(`Visual review: ${REVIEW_HTML}`);
+  console.log(`Text retrieval CSV: ${RETRIEVAL_CSV}`);
+  console.log(`Text retrieval audit: ${RETRIEVAL_HTML}`);
   console.log(`Preview directory: ${PREVIEW_DIR}`);
   if (options.apply) console.log("Apply mode: accepted AI selections will be uploaded to remote R2 and recorded in remote D1.");
   const limiter = new HostLimiter(options.perHostDelayMs);
   const aiQueue = selector ? new WorkQueue(options.aiConcurrency) : null;
   let completed = 0;
   const batches = await mapLimit(institutions, options.concurrency, async (institution) => {
-    const rows = await evaluateInstitution(institution, options, limiter, selector, aiQueue);
+    const result = await evaluateInstitution(institution, options, limiter, selector, aiQueue);
     completed += 1;
     console.log(`Evaluated ${completed}/${institutions.length}: ${institution.name}`);
-    return rows;
+    return result;
   });
-  const rows = batches.flat();
+  const rows = batches.flatMap((result) => result.reviewRows);
+  const retrievalRows = batches.flatMap((result) => result.retrievalRows);
   await appendManifestRows(rows);
+  await writeRetrievalArtifacts([...existingRetrievalRows, ...retrievalRows]);
   if (!options.apply) await writeReviewArtifacts([...existingRows, ...rows]);
 
   const statusCounts = new Map<string, number>();

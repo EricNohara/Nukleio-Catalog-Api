@@ -1,6 +1,6 @@
 # Logo enrichment with local AI
 
-`scripts/logos/scrape-website-logos.ts` discovers likely logo assets from each school's official site, converts up to five candidates to compressed WebP previews, and asks a local vision-language model to select one official institution or district logo—or decline them all.
+`scripts/logos/scrape-website-logos.ts` builds a broad inventory of image, SVG, CSS, and metadata assets from each school's official site. It records each asset's semantic DOM ancestry all the way to the document root, uses local AI to text-rank the inventory, converts the top ranked assets to compressed WebP previews, and asks a local vision-language model to select one official institution or district logo—or decline them all.
 
 The script has two modes:
 
@@ -34,9 +34,18 @@ From the repository root, reset prior local evaluation artifacts, evaluate a ran
 npm run logos:scrape -- --reset-review --yes
 npm run logos:scrape -- --limit 20 --concurrency 8 --seed logo-eval-001
 Invoke-Item .\data\logos\logo-review.html
+Invoke-Item .\data\logos\logo-retrieval-review.html
 ```
 
-The visual page shows the AI's one school-level choice and confidence once, then labels every candidate by its own AI classification (for example, `wordmark · eligible` or `photo · rejected`). It still shows every candidate so selections and declines can be assessed quickly.
+The visual page shows the AI's one school-level choice and confidence once, then labels every candidate by its own AI classification (for example, `wordmark · eligible` or `photo · rejected`). It still shows every candidate so selections and declines can be assessed quickly. The detailed manifest retains the original candidate metadata, semantic ancestry, and page region for retrieval debugging.
+
+`data/logos/logo-retrieval-review.html` and `data/logos/logo-retrieval-review.csv` are the first-stage text-ranking audit. They list every discovered DOM asset, its element metadata and semantic ancestry, its batch rank, and whether the text model handed it to visual evaluation. Use them to tell whether a missing logo was never discovered or was excluded by the text-ranking layer. They do not make a claim that an asset is a logo.
+
+The scraper handles structured attributes such as Finalsite's `data-image-sizes` as JSON asset descriptors rather than as `srcset`; the audit therefore links to the actual asset URL. Favicons and web-manifest icons are shown as `deferred_favicon` and do not compete with ordinary assets in text ranking. They are only used as a last-resort visual fallback when no normal page asset reaches visual evaluation.
+
+Responsive CDN renditions of the same versioned source image are collapsed before text ranking, downloading, and visual evaluation. Video and audio assets are discarded during discovery and are also rejected by their response media type as a safeguard.
+
+The review retains transparent WebP previews and displays them on a dark checkerboard so white marks are visible. The local vision model receives a separate dark-composited copy of the same preview; this avoids losing white-on-transparent marks while keeping the stored logo asset transparent.
 
 `--seed` makes the random, category-balanced sample reproducible. If it is omitted, the script prints a generated seed; reuse that value with `--seed <value>` to recreate the same sample against the same local D1 state.
 
@@ -74,8 +83,8 @@ education/colleges/<institution-id>.webp
 education/high-schools/<institution-id>.webp
 ```
 
-Apply mode is intentionally explicit. It requires active Cloudflare authentication, always requires `--yes`, and refuses to run with `--no-ai`. It does not generate the HTML review; use evaluation mode for visual checking.
+Apply mode is intentionally explicit. It requires active Cloudflare authentication, always requires `--yes`, and refuses to run with `--no-ai`. It does not generate the visual candidate review; use evaluation mode for visual checking. It does retain the local text-retrieval audit for troubleshooting.
 
 ## Swapping the AI implementation
 
-The scraper depends on the `LogoSelector` interface in `scripts/logos/logo-selector.ts`, not directly on Ollama. `OllamaLogoSelector` sends all candidate previews for a school in one schema-constrained chat request. A different local runtime or a future hosted selector can replace that class while keeping the scraping, review, and apply workflows unchanged.
+The scraper depends on the `LogoSelector` interface in `scripts/logos/logo-selector.ts`, not directly on Ollama. `OllamaLogoSelector` first performs text-only inventory ranking and then sends the short-listed previews in one schema-constrained visual request. A different local runtime or a future hosted selector can replace that class while keeping the scraping, review, and apply workflows unchanged.
